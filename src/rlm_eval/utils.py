@@ -136,14 +136,34 @@ def extract_lean_codes(content: str) -> list[str]:
     return lean_codes
 
 
-def generate_n_samples_sequence(max_n: int) -> list[int]:
-    """Generate the sequence 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, ... until max_n, max_n included."""
-    repeating_seq = [1, 2, 5]
-    sequence = []
-    i = 1
-    while i <= max_n:
-        sequence.extend([i * r for r in repeating_seq if i * r <= max_n])
-        i *= 10
-    if sequence[-1] != max_n:
+def generate_n_samples_sequence(max_n: int, sequence_type: str = "125") -> list[int]:
+    """Generate a sequence of sample sizes up to max_n.
+
+    Args:
+        max_n: The maximum number of samples to generate.
+        sequence_type: The type of sequence to generate. Options are:
+            - "125": Generate the sequence 1, 2, 5, 10, 20, 50, 100, ... (default)
+            - "pow2": Generate the sequence 1, 2, 4, 8, 16, 32, 64, ... (powers of 2)
+
+    Returns:
+        A list of integers representing the sample sizes.
+    """
+    if sequence_type == "125":
+        repeating_seq = [1, 2, 5]
+        sequence = []
+        i = 1
+        while i <= max_n:
+            sequence.extend([i * r for r in repeating_seq if i * r <= max_n])
+            i *= 10
+    elif sequence_type == "pow2":
+        sequence = []
+        i = 1
+        while i <= max_n:
+            sequence.append(i)
+            i *= 2
+    else:
+        raise ValueError(f"Unknown sequence type: {sequence_type}. Valid options are '125' or 'pow2'.")
+
+    if len(sequence) > 0 and sequence[-1] != max_n:
         sequence.append(max_n)
     return sequence

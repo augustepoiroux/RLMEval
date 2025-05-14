@@ -78,6 +78,7 @@ class ProvingEvaluation:
         verbose: bool = False,
         n_processes: int | None = 1,
         prompt_context: PromptContext = PromptContext.FILE_CONTEXT,
+        gen_processes: int | None = None,
     ) -> tuple[int, int]:
         # first build the DAG of the blueprint
         blueprint_graph = nx.DiGraph()
@@ -166,8 +167,27 @@ class ProvingEvaluation:
             except Exception as e:
                 return node, None, 0, 0, str(e)
 
-        # Run sequential processing
-        results = [prove_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Proving theorems")]
+        results = []
+
+        if gen_processes is not None and gen_processes > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=gen_processes) as executor:
+                logger.info(f"Using {gen_processes} threads for proof generation")
+                futures = [
+                    executor.submit(prove_node_wrapper, node_label, verbose=False)
+                    for node_label in eligible_node_labels
+                ]
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Proving theorems"
+                ):
+                    if future.exception() is not None:
+                        logger.error(f"Error while proving a node: {future.exception()}")
+                    else:
+                        results.append(future.result())
+        else:
+            # Standard sequential processing
+            results = [
+                prove_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Proving theorems")
+            ]
 
         # Process results
         predictions_to_check = []
@@ -242,7 +262,7 @@ class ProvingEvaluation:
             iterator = tqdm(iterator, total=len(args_list), desc="Processing predictions")
 
         aggregated_check_results = defaultdict(lambda: defaultdict(float))
-        pass_n_seq = generate_n_samples_sequence(nb_attempts)
+        pass_n_seq = generate_n_samples_sequence(nb_attempts, sequence_type="pow2")
 
         # Initialize counters for averages
         total_nodes = 0
@@ -433,7 +453,65 @@ def _prove_node(
                 case PromptContext.NO_CONTEXT:
                     raise NotImplementedError("No context is not yet implemented for chat prompts.")
                 case PromptContext.FILE_CONTEXT_NO_LEMMAS:
-                    raise NotImplementedError("File context without lemmas is not yet implemented for chat prompts.")
+
+                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
+                        # Get all lemma names from the blueprint graph
+                        blueprint_lemmas = set()
+                        for blueprint_node in blueprint_graph.nodes():
+                            node_data = blueprint_graph.nodes[blueprint_node]
+                            if "lean_declarations" in node_data:
+                                for lean_decl in node_data["lean_declarations"]:
+                                    if "full_name" in lean_decl:
+                                        blueprint_lemmas.add(lean_decl["full_name"])
+
+                        # Process the context by removing proofs and non-blueprint lemmas
+                        lean_processor = LeanFilesProcessor(lean_declarations)
+                        lean_context = lean_processor.remove_theorems(
+                            lean_declaration["file"], original_lean_context, whitelist=blueprint_lemmas
+                        )
+
+                        # Additional compression if needed
+                        lean_context = compress_lean_context(lean_context, level=level)
+
+                        # Format the prompt
+                        prompt = "Here is the Lean 4 context:\n```lean4\n" + lean_context.strip() + "\n```"
+                        prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
+                        prompt += f"```lean4\n{_node_informal_comment(node)}```"
+                        prompt += "\nStart your formalization like this:\n```lean4\n:= by"
+                        return prompt
+
+                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
+                    messages = None
+                    compress_level = 0
+                    for compress_level in range(16):
+                        messages = clean_messages(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
+                                }
+                            ]
+                        )
+                        if token_counter(model=model, messages=messages) <= max_input_tokens:
+                            break
+                        else:
+                            messages = None
+                    if not messages:
+                        compress_level = -1
+                        messages = clean_messages(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
+                                }
+                            ]
+                        )
+                        if token_counter(model=model, messages=messages) > max_input_tokens:
+                            logger.warning(
+                                f"Natural language context too large for node {node['label']}. Skipping formalization."
+                            )
+                            return [None for _ in range(nb_attempts)], 0, 0
+
                 case PromptContext.FILE_CONTEXT:
 
                     def instantiate_prompt(lean_context: str, level: int = 0) -> str:
@@ -514,7 +592,54 @@ def _prove_node(
                     prompt = f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:"
                     raise NotImplementedError("No context is not yet implemented for chat prompts.")
                 case PromptContext.FILE_CONTEXT_NO_LEMMAS:
-                    raise NotImplementedError("File context without lemmas is not yet implemented for chat prompts.")
+
+                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
+                        # Get all lemma names from the blueprint graph
+                        blueprint_lemmas = set()
+                        for blueprint_node in blueprint_graph.nodes():
+                            node_data = blueprint_graph.nodes[blueprint_node]
+                            if "lean_declarations" in node_data:
+                                for lean_decl in node_data["lean_declarations"]:
+                                    if "full_name" in lean_decl:
+                                        blueprint_lemmas.add(lean_decl["full_name"])
+
+                        # Process the context by removing proofs and non-blueprint lemmas
+                        lean_processor = LeanFilesProcessor(lean_declarations)
+                        lean_context = lean_processor.remove_theorems(
+                            lean_declaration["file"], original_lean_context, whitelist=blueprint_lemmas
+                        )
+
+                        # Additional compression if needed
+                        lean_context = compress_lean_context(lean_context, level=level)
+
+                        # Format the prompt
+                        prompt = (
+                            "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
+                            + lean_context.strip()
+                        ).strip()
+                        prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
+                        prompt += f"```lean4\n{_node_informal_comment(node)}```"
+                        prompt += "\nStart your formalization like this:\n```lean4\n:= by"
+                        return prompt
+
+                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
+                    prompt = None
+                    compress_level = 0
+                    for compress_level in range(16):
+                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
+                        if token_counter(model=model, text=prompt) <= max_input_tokens:
+                            break
+                        else:
+                            prompt = None
+                    if not prompt:
+                        compress_level = -1
+                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
+                        if token_counter(model=model, text=prompt) > max_input_tokens:
+                            logger.warning(
+                                f"Natural language context too large for node {node['label']}. Skipping formalization."
+                            )
+                            return [None for _ in range(nb_attempts)], 0, 0
+
                 case PromptContext.FILE_CONTEXT:
 
                     def instantiate_prompt(lean_context: str, level: int = 0) -> str:
@@ -731,6 +856,7 @@ if __name__ == "__main__":
     use_chat_prompt = model_config.get("use_chat_prompt", True)
     stopwords = model_config.get("stopwords", ["```\n", ":= by", "sorry"])
     n_processes = model_config.get("n_processes", 15)
+    gen_processes = model_config.get("gen_processes", None)
     prompt_context = PromptContext[model_config.get("prompt_context", "FILE_CONTEXT")]
     api_key = model_config.get("api_key", None)
     api_base_url = model_config.get("api_base_url", None)
@@ -746,7 +872,7 @@ if __name__ == "__main__":
         project_name_bench = repo["project_name"]
         project_dir = f"{git_url.split('/')[-1]}_{commit}"
         project_root_dir = os.path.join(traced_repos_dir, project_dir)
-        lean_project_root_dir = os.path.join(project_root_dir, project_name_bench)
+        lean_project_root_dir = os.path.join(project_root_dir, git_url.split("/")[-1])
 
         console.rule(f"Formalizing {project_name_bench}")
 
@@ -767,6 +893,13 @@ if __name__ == "__main__":
             model_name.split("/")[-1],
             datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
+
+        # Copy the benchmark and model config files to the result folder
+        os.makedirs(output_folder, exist_ok=True)
+        with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
+            yaml.safe_dump(benchmark_config, f)
+        with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
+            yaml.safe_dump(model_config, f)
 
         agent = ProvingEvaluation(
             blueprint_with_lean=blueprint_to_lean,
@@ -790,4 +923,5 @@ if __name__ == "__main__":
             use_chat_prompt=use_chat_prompt,
             n_processes=n_processes,
             prompt_context=prompt_context,
+            gen_processes=gen_processes,
         )
