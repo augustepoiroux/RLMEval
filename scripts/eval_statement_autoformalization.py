@@ -79,6 +79,7 @@ class StatementAutoformalizationEvaluation:
         verbose: bool = False,
         n_processes: int | None = 1,
         prompt_context: PromptContext = PromptContext.FILE_CONTEXT,
+        gen_processes: int | None = None,
     ) -> tuple[int, int]:
         # first build the DAG of the blueprint
         blueprint_graph = nx.DiGraph()
@@ -167,10 +168,28 @@ class StatementAutoformalizationEvaluation:
             except Exception as e:
                 return node, None, 0, 0, str(e)
 
-        # Run sequential processing
-        results = [
-            formalize_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Formalizing theorems")
-        ]
+        results = []
+
+        if gen_processes is not None and gen_processes > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=gen_processes) as executor:
+                logger.info(f"Using {gen_processes} threads for proof generation")
+                futures = [
+                    executor.submit(formalize_node_wrapper, node_label, verbose=False)
+                    for node_label in eligible_node_labels
+                ]
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Formalizing theorems"
+                ):
+                    if future.exception() is not None:
+                        logger.error(f"Error while formalizing a node: {future.exception()}")
+                    else:
+                        results.append(future.result())
+        else:
+            # Standard sequential processing
+            results = [
+                formalize_node_wrapper(node_label)
+                for node_label in tqdm(eligible_node_labels, desc="Formalizing theorems")
+            ]
 
         # Process results
         predictions_to_check = []
@@ -862,6 +881,7 @@ if __name__ == "__main__":
     use_chat_prompt = model_config.get("use_chat_prompt", True)
     stopwords = model_config.get("stopwords", ["```\n", ":= by", "sorry"])
     n_processes = model_config.get("n_processes", 15)
+    gen_processes = model_config.get("gen_processes", 1)
     prompt_context = PromptContext[model_config.get("prompt_context", "FILE_CONTEXT")]
     api_key = model_config.get("api_key", None)
     api_base_url = model_config.get("api_base_url", None)
@@ -877,7 +897,7 @@ if __name__ == "__main__":
         project_name_bench = repo["project_name"]
         project_dir = f"{git_url.split('/')[-1]}_{commit}"
         project_root_dir = os.path.join(traced_repos_dir, project_dir)
-        lean_project_root_dir = os.path.join(project_root_dir, project_name_bench)
+        lean_project_root_dir = os.path.join(project_root_dir, git_url.split("/")[-1])
 
         console.rule(f"Formalizing {project_name_bench}")
 
@@ -922,4 +942,5 @@ if __name__ == "__main__":
             use_chat_prompt=use_chat_prompt,
             n_processes=n_processes,
             prompt_context=prompt_context,
+            gen_processes=gen_processes,
         )
