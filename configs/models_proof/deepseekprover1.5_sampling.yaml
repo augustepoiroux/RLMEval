@@ -1,0 +1,15 @@
+model: "hosted_vllm/deepseek-ai/DeepSeek-Prover-V1.5-RL"
+temperature: 1.0
+top_p: 0.95
+nb_samples: 128
+max_total_tokens: 8192
+max_generated_tokens: 2048
+use_chat_prompt: false
+stopwords:
+  - "```"
+  - "sorry"
+  - "\n\n"
+n_processes: 15
+prompt_context: "FILE_CONTEXT"
+api_key: "-"
+api_base_url: "http://localhost:8080/v1"
