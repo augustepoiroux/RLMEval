@@ -920,6 +920,12 @@ if __name__ == "__main__":
             datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
 
+        # Copy the benchmark and model config files to the result folder
+        with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
+            yaml.safe_dump(benchmark_config, f)
+        with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
+            yaml.safe_dump(model_config, f)
+
         agent = StatementAutoformalizationEvaluation(
             blueprint_with_lean=blueprint_to_lean,
             lean_files=lean_files,
