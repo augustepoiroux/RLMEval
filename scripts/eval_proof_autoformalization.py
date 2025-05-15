@@ -15,6 +15,7 @@ import networkx as nx
 import yaml
 from lean_interact import AutoLeanServer, LeanREPLConfig, LocalProject
 from lean_interact.interface import Command, LeanError
+from lean_interact.utils import indent_code
 from litellm import completion, text_completion
 from litellm.caching.caching import Cache, LiteLLMCacheType
 from litellm.exceptions import ContextWindowExceededError
@@ -105,7 +106,11 @@ class ProvingEvaluation:
             if "proof" not in node or "text" not in node["proof"]:
                 logger.info(f"Skipping {node_label}: no informal proof found.")
                 continue
-            lean_declarations_with_file = [lean_decl for lean_decl in node["lean_declarations"] if "file" in lean_decl]
+            lean_declarations_with_file = [
+                lean_decl
+                for lean_decl in node["lean_declarations"]
+                if "file" in lean_decl and "theorem_info" in lean_decl
+            ]
             if len(lean_declarations_with_file) > 1:
                 logger.info(
                     f"Skipping {node_label}: multiple Lean declarations per node is not yet supported for evaluation."
@@ -178,7 +183,7 @@ class ProvingEvaluation:
                     for node_label in eligible_node_labels
                 ]
                 for future in tqdm(
-                    concurrent.futures.as_completed(futures), total=len(futures), desc="Proving theorems"
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Generating proofs"
                 ):
                     if future.exception() is not None:
                         logger.error(f"Error while proving a node: {future.exception()}")
@@ -187,7 +192,7 @@ class ProvingEvaluation:
         else:
             # Standard sequential processing
             results = [
-                prove_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Proving theorems")
+                prove_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Generating proofs")
             ]
 
         # Process results
@@ -260,9 +265,9 @@ class ProvingEvaluation:
             iterator = map(_process_predictions, args_list)
 
         if verbose:
-            iterator = tqdm(iterator, total=len(args_list), desc="Processing predictions")
+            iterator = tqdm(iterator, total=len(args_list), desc="Checking proofs")
 
-        aggregated_check_results = defaultdict(lambda: defaultdict(float))
+        aggregated_check_results = defaultdict(lambda: defaultdict(int))
         pass_n_seq = generate_n_samples_sequence(nb_attempts, sequence_type="pow2")
 
         # Initialize counters for averages
@@ -301,15 +306,15 @@ class ProvingEvaluation:
                     )
                 )
 
-            check_results = defaultdict(lambda: defaultdict(float))
+            check_results = defaultdict(lambda: defaultdict(int))
 
             def update_dict(key, result: PredictionEvaluationResult, target_dict: dict) -> None:
-                target_dict["Well-typed"][key] = max(target_dict["Well-typed"].get(key, 0), float(result.well_typed))
+                target_dict["Well-typed"][key] = max(target_dict["Well-typed"].get(key, 0), result.well_typed)
 
             assert len(validity_results) == nb_attempts
             pass_n_seq_iter = iter(pass_n_seq)
             next_n = next(pass_n_seq_iter)
-            cumulative_results = defaultdict(lambda: defaultdict(float))
+            cumulative_results = defaultdict(lambda: defaultdict(int))
             for idx_res, result in enumerate(validity_results):
                 # Update cumulative results
                 update_dict(None, result, cumulative_results)
@@ -484,7 +489,7 @@ def _prove_node(
             else:
                 lean_code = compressed_lean_context.strip() + " := by\n"
                 if nl_proof_hint:
-                    lean_code += _node_informal_text(node)
+                    lean_code += indent_code(_node_informal_comment(node), 2)
                 prompt = (
                     "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
                     + lean_code
@@ -903,8 +908,8 @@ if __name__ == "__main__":
             if n != "Total":
                 summary_table.add_column(f"pass@{n}", style="green")
 
-        summary_table.add_column("System Errors", style="yellow")
-        summary_table.add_column("Empty Predictions", style="red")
+        summary_table.add_column("System Errors", style="red")
+        summary_table.add_column("Empty Predictions", style="yellow")
         summary_table.add_column("Tokens In/Out", style="blue")
 
         # Calculate total nodes across all repos

@@ -2,8 +2,8 @@ model: "hosted_vllm/AI-MO/Kimina-Prover-Preview-Distill-7B"
 temperature: 0.6
 top_p: 0.95
 nb_samples: 128
-max_total_tokens: 32768
-max_generated_tokens: 8192
+max_total_tokens: 16384
+max_generated_tokens: 4096
 use_chat_prompt: false
 stopwords:
   - "```"
