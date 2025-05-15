@@ -66,7 +66,7 @@ def fix_first_tactic_indentation(lean_proof: str) -> str:
         return lean_proof  # Only one tactic, nothing to align to
 
     # Rebuild lines, fixing the first tactic's indentation
-    lines[0] = indent_code(lines[0], min_indent)
+    lines[0] = indent_code(lines[0].lstrip(), min_indent)
     return "\n".join(lines)
 
 
