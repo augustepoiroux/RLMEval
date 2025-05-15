@@ -49,7 +49,7 @@ def merge_consecutive_roles(messages):
     return merged_messages
 
 
-def clean_messages(messages):
+def clean_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     messages = deepcopy(messages)
     messages = merge_consecutive_roles(messages)
     for message in messages:
