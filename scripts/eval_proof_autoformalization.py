@@ -45,6 +45,31 @@ class PromptContext(Enum):
     FILE_CONTEXT_NO_LEMMAS = "file_context_no_lemmas"
 
 
+def fix_first_tactic_indentation(lean_proof: str) -> str:
+    """
+    Sets the indentation of the first tactic line to the minimum indentation
+    found among all subsequent non-empty lines.
+    Some LLMs do not align correctly the first tactic, hence this function.
+    """
+    if not lean_proof:
+        return lean_proof
+    lines = lean_proof.splitlines()
+
+    # Find minimum indentation among all subsequent non-empty lines
+    min_indent = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() != "":
+            indent = len(lines[idx]) - len(lines[idx].lstrip())
+            if min_indent is None or indent < min_indent:
+                min_indent = indent
+    if min_indent is None:
+        return lean_proof  # Only one tactic, nothing to align to
+
+    # Rebuild lines, fixing the first tactic's indentation
+    lines[0] = indent_code(lines[0], min_indent)
+    return "\n".join(lines)
+
+
 class ProvingEvaluation:
     def __init__(
         self,
@@ -557,7 +582,8 @@ def _prove_node(
                     for choice in completion_response.choices  # type: ignore
                 ]
                 predictions = [
-                    "\n\n".join(extract_lean_codes(prediction)) if prediction else None for prediction in predictions
+                    fix_first_tactic_indentation("\n".join(extract_lean_codes(prediction))) if prediction else None
+                    for prediction in predictions
                 ]
 
             except ContextWindowExceededError:
@@ -603,7 +629,9 @@ def _prove_node(
                 )
 
                 predictions = [
-                    choice.text if choice.text and choice.text.strip() and choice.finish_reason != "length" else None  # type: ignore
+                    fix_first_tactic_indentation(choice.text)  # type: ignore
+                    if choice.text and choice.text.strip() and choice.finish_reason != "length"  # type: ignore
+                    else None
                     for choice in completion_response.choices  # type: ignore
                 ]
 
