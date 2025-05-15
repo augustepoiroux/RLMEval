@@ -15,7 +15,6 @@ import networkx as nx
 import yaml
 from lean_interact import AutoLeanServer, LeanREPLConfig, LocalProject
 from lean_interact.interface import Command, LeanError
-from lean_interact.utils import clean_theorem_string
 from litellm import completion, text_completion
 from litellm.caching.caching import Cache, LiteLLMCacheType
 from litellm.exceptions import ContextWindowExceededError
@@ -27,7 +26,6 @@ from tqdm import tqdm
 
 from rlm_eval.data_processing.lean_utils import LeanFilesProcessor, trim_comments_end
 from rlm_eval.utils import (
-    DATA_DIR,
     ROOT_DIR,
     clean_messages,
     console,
@@ -79,6 +77,7 @@ class ProvingEvaluation:
         n_processes: int | None = 1,
         prompt_context: PromptContext = PromptContext.FILE_CONTEXT,
         gen_processes: int | None = None,
+        nl_proof_hint: bool = True,
     ) -> tuple[int, int]:
         # first build the DAG of the blueprint
         blueprint_graph = nx.DiGraph()
@@ -139,6 +138,7 @@ class ProvingEvaluation:
             max_generated_tokens=max_generated_tokens,
             max_total_tokens=max_total_tokens,
             prompt_context=prompt_context,
+            nl_proof_hint=nl_proof_hint,
             console=console,
         ):
             node = blueprint_graph.nodes[node_label]
@@ -161,6 +161,7 @@ class ProvingEvaluation:
                     max_generated_tokens=max_generated_tokens,
                     max_total_tokens=max_total_tokens,
                     prompt_context=prompt_context,
+                    nl_proof_hint=nl_proof_hint,
                     console=console,
                 )
                 return node, predictions, input_tokens, output_tokens, None
@@ -300,10 +301,6 @@ class ProvingEvaluation:
                     )
                 )
 
-            lean_codes = [result.lean_proof for result in validity_results if result.lean_proof is not None]
-            well_typed_lean_codes: list[str] = [result.lean_proof for result in validity_results if result.well_typed]  # type: ignore
-            assert all(code is not None for code in well_typed_lean_codes)
-
             check_results = defaultdict(lambda: defaultdict(float))
 
             def update_dict(key, result: PredictionEvaluationResult, target_dict: dict) -> None:
@@ -419,6 +416,7 @@ def _prove_node(
     max_total_tokens: int,
     max_generated_tokens: int,
     prompt_context: PromptContext,
+    nl_proof_hint: bool,
     console=console,
 ) -> tuple[list[str | None], int, int]:
     # prepare prompt context
@@ -448,113 +446,88 @@ def _prove_node(
     max_input_tokens = int(0.8 * (max_total_tokens - max_generated_tokens))
 
     with optional_status(f"Generating proofs for node {node['label']}...", enabled=verbose):
+        # Helper functions for prompt generation
+        def create_prompt_for_context(lean_context: str, context_type: PromptContext, level: int = 0) -> str:
+            """Create prompt text based on the context type."""
+            if context_type == PromptContext.NO_CONTEXT:
+                return f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:"
+
+            # Apply compression to lean_context based on level
+            compressed_lean_context = compress_lean_context(lean_context, level=level)
+
+            # Get blueprint lemmas for NO_LEMMAS contexts
+            if context_type == PromptContext.FILE_CONTEXT_NO_LEMMAS:
+                # Get all lemma names from the blueprint graph
+                blueprint_lemmas = set()
+                for blueprint_node in blueprint_graph.nodes():
+                    node_data = blueprint_graph.nodes[blueprint_node]
+                    if "lean_declarations" in node_data:
+                        for lean_decl in node_data["lean_declarations"]:
+                            if "full_name" in lean_decl:
+                                blueprint_lemmas.add(lean_decl["full_name"])
+
+                # Process the context by removing proofs and non-blueprint lemmas
+                lean_processor = LeanFilesProcessor(lean_declarations)
+                compressed_lean_context = lean_processor.remove_theorems(
+                    lean_declaration["file"], compressed_lean_context, whitelist=blueprint_lemmas
+                )
+
+            # Format the prompt based on whether it's chat or completion
+            if use_chat_prompt:
+                prompt = "Here is the Lean 4 context:\n```lean4\n" + compressed_lean_context.strip() + " := by\n```"
+                if nl_proof_hint:
+                    prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
+                    prompt += f"```lean4\n{_node_informal_comment(node)}```"
+                else:
+                    prompt += "\n\nUsing this context, prove the last statement in Lean 4."
+                prompt += "\nStart your response like this:\n```lean4\n:= by"
+            else:
+                lean_code = compressed_lean_context.strip() + " := by\n"
+                if nl_proof_hint:
+                    lean_code += _node_informal_text(node)
+                prompt = (
+                    "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
+                    + lean_code
+                ).strip()
+
+            return prompt
+
+        def find_appropriate_compression_level(
+            input_text: str, counter_func, max_tokens: int
+        ) -> tuple[int, dict[str, list[dict[str, str]] | str]]:
+            """Find an appropriate compression level and return the level and processed text."""
+            for level in range(16):  # Try compression levels 0-15
+                processed_text = counter_func(input_text, level)
+                if processed_text and token_counter(model=model, **processed_text) <= max_tokens:
+                    return level, processed_text
+
+            # If all compression attempts fail, try level -1 (no context)
+            level = -1
+            processed_text = counter_func(input_text, level)
+            return level, processed_text
+
+        # Process based on whether we're using chat or completion API
         if use_chat_prompt:
-            match prompt_context:
-                case PromptContext.NO_CONTEXT:
-                    raise NotImplementedError("No context is not yet implemented for chat prompts.")
-                case PromptContext.FILE_CONTEXT_NO_LEMMAS:
+            # Function to prepare messages at a specific compression level
+            def prepare_messages(context: str, level: int) -> dict[str, list[dict[str, str]]]:
+                prompt = create_prompt_for_context(context, prompt_context, level)
+                return {"messages": clean_messages([{"role": "user", "content": prompt}])}
 
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        # Get all lemma names from the blueprint graph
-                        blueprint_lemmas = set()
-                        for blueprint_node in blueprint_graph.nodes():
-                            node_data = blueprint_graph.nodes[blueprint_node]
-                            if "lean_declarations" in node_data:
-                                for lean_decl in node_data["lean_declarations"]:
-                                    if "full_name" in lean_decl:
-                                        blueprint_lemmas.add(lean_decl["full_name"])
+            if prompt_context == PromptContext.NO_CONTEXT:
+                compress_level = 0
+                messages = prepare_messages("", compress_level)
+            else:
+                # Find appropriate compression level
+                compress_level, messages = find_appropriate_compression_level(
+                    original_lean_context, prepare_messages, max_input_tokens
+                )
+            assert isinstance(messages["messages"], list)
 
-                        # Process the context by removing proofs and non-blueprint lemmas
-                        lean_processor = LeanFilesProcessor(lean_declarations)
-                        lean_context = lean_processor.remove_theorems(
-                            lean_declaration["file"], original_lean_context, whitelist=blueprint_lemmas
-                        )
+            if not messages or token_counter(model=model, **messages) > max_input_tokens:  # type: ignore
+                logger.warning(f"Natural language context too large for node {node['label']}. Skipping formalization.")
+                return [None for _ in range(nb_attempts)], 0, 0
 
-                        # Additional compression if needed
-                        lean_context = compress_lean_context(lean_context, level=level)
-
-                        # Format the prompt
-                        prompt = "Here is the Lean 4 context:\n```lean4\n" + lean_context.strip() + "\n```"
-                        prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
-                        prompt += f"```lean4\n{_node_informal_comment(node)}```"
-                        prompt += "\nStart your formalization like this:\n```lean4\n:= by"
-                        return prompt
-
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
-                    messages = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) <= max_input_tokens:
-                            break
-                        else:
-                            messages = None
-                    if not messages:
-                        compress_level = -1
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
-
-                case PromptContext.FILE_CONTEXT:
-
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        lean_context = compress_lean_context(lean_context, level=level)
-                        prompt = "Here is the Lean 4 context:\n```lean4\n" + lean_context.strip() + "\n```"
-                        prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
-                        prompt += f"```lean4\n{_node_informal_comment(node)}```"
-                        prompt += "\nStart your formalization like this:\n```lean4\n:= by"
-                        return prompt
-
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
-                    messages = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) <= max_input_tokens:
-                            break
-                        else:
-                            messages = None
-                    if not messages:
-                        compress_level = -1
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
-
-            # dump the messages to a file
+            # Save messages to file
             with open(
                 os.path.join(output_folder, f"input_messages_compress_{compress_level}.json"), "w"
             ) as inputs_file:
@@ -565,7 +538,7 @@ def _prove_node(
                     api_key=api_key,
                     api_base=api_base_url,
                     model=model,
-                    messages=messages,
+                    messages=messages["messages"],
                     max_tokens=max_generated_tokens,
                     temperature=temperature,
                     top_p=top_p,
@@ -573,102 +546,40 @@ def _prove_node(
                     caching=True,
                     stop=stopwords,
                 )
+
+                predictions = [
+                    choice.message.content if choice.message.content and choice.message.content.strip() else None  # type: ignore
+                    for choice in completion_response.choices  # type: ignore
+                ]
+                predictions = [
+                    "\n\n".join(extract_lean_codes(prediction)) if prediction else None for prediction in predictions
+                ]
+
             except ContextWindowExceededError:
                 logger.warning(f"Context window exceeded for node {node['label']}")
                 return [None for _ in range(nb_attempts)], 0, 0
-
-            predictions = [
-                choice.message.content if choice.message.content and choice.message.content.strip() else None  # type: ignore
-                for choice in completion_response.choices  # type: ignore
-            ]
-            predictions = [
-                "\n\n".join(extract_lean_codes(prediction)) if prediction else None for prediction in predictions
-            ]
-
         else:
-            match prompt_context:
-                case PromptContext.NO_CONTEXT:
-                    compress_level = 0
-                    prompt = f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:"
-                    raise NotImplementedError("No context is not yet implemented for chat prompts.")
-                case PromptContext.FILE_CONTEXT_NO_LEMMAS:
+            # Function to prepare prompt at a specific compression level
+            def prepare_prompt(context: str, level: int) -> dict[str, str]:
+                return {"text": create_prompt_for_context(context, prompt_context, level)}
 
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        # Get all lemma names from the blueprint graph
-                        blueprint_lemmas = set()
-                        for blueprint_node in blueprint_graph.nodes():
-                            node_data = blueprint_graph.nodes[blueprint_node]
-                            if "lean_declarations" in node_data:
-                                for lean_decl in node_data["lean_declarations"]:
-                                    if "full_name" in lean_decl:
-                                        blueprint_lemmas.add(lean_decl["full_name"])
+            if prompt_context == PromptContext.NO_CONTEXT:
+                compress_level = 0
+                prompt_text = prepare_prompt("", compress_level)
+            else:
+                # Find appropriate compression level
+                compress_level, prompt_text = find_appropriate_compression_level(
+                    original_lean_context, prepare_prompt, max_input_tokens
+                )
+            assert isinstance(prompt_text["text"], str)
 
-                        # Process the context by removing proofs and non-blueprint lemmas
-                        lean_processor = LeanFilesProcessor(lean_declarations)
-                        lean_context = lean_processor.remove_theorems(
-                            lean_declaration["file"], original_lean_context, whitelist=blueprint_lemmas
-                        )
+            if not prompt_text or token_counter(model=model, **prompt_text) > max_input_tokens:  # type: ignore
+                logger.warning(f"Natural language context too large for node {node['label']}. Skipping formalization.")
+                return [None for _ in range(nb_attempts)], 0, 0
 
-                        # Additional compression if needed
-                        lean_context = compress_lean_context(lean_context, level=level)
+            prompt = prompt_text["text"]
 
-                        # Format the prompt
-                        prompt = (
-                            "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
-                            + lean_context.strip()
-                        ).strip()
-                        prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
-                        prompt += f"```lean4\n{_node_informal_comment(node)}```"
-                        prompt += "\nStart your formalization like this:\n```lean4\n:= by"
-                        return prompt
-
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
-                    prompt = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) <= max_input_tokens:
-                            break
-                        else:
-                            prompt = None
-                    if not prompt:
-                        compress_level = -1
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
-
-                case PromptContext.FILE_CONTEXT:
-
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        lean_context = compress_lean_context(lean_context, level=level)
-                        lean_context += " := by\n" + _node_informal_comment(node)
-                        return (
-                            "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
-                            + lean_context.strip()
-                        ).strip()
-
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try to compress it
-                    prompt = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) <= max_input_tokens:
-                            break
-                        else:
-                            prompt = None
-                    if not prompt:
-                        compress_level = -1
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
-
-            # dump the context to a file
+            # Save prompt to file
             with open(os.path.join(output_folder, f"input_context_compress_{compress_level}.txt"), "w") as context_file:
                 context_file.write(prompt)
 
@@ -685,14 +596,15 @@ def _prove_node(
                     stop=stopwords,
                     caching=True,
                 )
+
+                predictions = [
+                    choice.text if choice.text and choice.text.strip() and choice.finish_reason != "length" else None  # type: ignore
+                    for choice in completion_response.choices  # type: ignore
+                ]
+
             except ContextWindowExceededError:
                 logger.warning(f"Context window exceeded for node {node['label']}")
                 return [None for _ in range(nb_attempts)], 0, 0
-
-            predictions = [
-                choice.text if choice.text and choice.text.strip() else None  # type: ignore
-                for choice in completion_response.choices  # type: ignore
-            ]
 
         # dump the completion to a file
         with open(os.path.join(output_folder, "raw_completion.json"), "w") as completion_file:
@@ -805,7 +717,7 @@ def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[
     for i, lean_proof in enumerate(dedup_predictions):
         tmp_res.append(PredictionEvaluationResult(lean_proof=lean_proof))
 
-        if not lean_proof:
+        if not lean_proof or "apply?" in lean_proof or "sorry" in lean_proof:
             continue
 
         try:
@@ -858,12 +770,20 @@ if __name__ == "__main__":
     n_processes = model_config.get("n_processes", 15)
     gen_processes = model_config.get("gen_processes", None)
     prompt_context = PromptContext[model_config.get("prompt_context", "FILE_CONTEXT")]
+    nl_proof_hint = model_config.get("nl_proof_hint", True)
     api_key = model_config.get("api_key", None)
     api_base_url = model_config.get("api_base_url", None)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     verbose = True
 
     traced_repos_dir = os.path.join(ROOT_DIR, "traced_repos")
+
+    # For storing results across all repos
+    all_repos_results = []
+    all_repos_totals = {}
+    total_input_tokens_all = 0
+    total_output_tokens_all = 0
 
     for repo in projects:
         # Construct project directory and project name using benchmark info
@@ -891,7 +811,7 @@ if __name__ == "__main__":
             "proof",
             project_name_bench,
             model_name.split("/")[-1],
-            datetime.now().strftime("%Y%m%d_%H%M%S"),
+            timestamp,
         )
 
         # Copy the benchmark and model config files to the result folder
@@ -924,4 +844,191 @@ if __name__ == "__main__":
             n_processes=n_processes,
             prompt_context=prompt_context,
             gen_processes=gen_processes,
+            nl_proof_hint=nl_proof_hint,
         )
+
+        # Store repo results for summary
+        try:
+            with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
+                aggregated_results = json.load(f)
+            with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
+                total_stats = json.load(f)
+
+            # Store results for this repo
+            repo_result = {
+                "project_name": project_name_bench,
+                "aggregated_results": aggregated_results,
+                "total_stats": total_stats,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+            }
+            all_repos_results.append(repo_result)
+
+            # Accumulate token usage
+            total_input_tokens_all += total_input_tokens
+            total_output_tokens_all += total_output_tokens
+
+            # Merge totals
+            for key, value in total_stats.items():
+                if key not in all_repos_totals:
+                    all_repos_totals[key] = 0
+                all_repos_totals[key] += value
+        except FileNotFoundError:
+            logger.warning(f"Results files not found for {project_name_bench}")
+
+    # Print summary table for all repos
+    if all_repos_results:
+        console.rule(f"Summary of All Repositories - {model_name}")
+
+        # Find all n values present in any repo's results
+        all_n_values = set()
+        for repo in all_repos_results:
+            agg_results = repo.get("aggregated_results", {})
+            if "Well-typed" in agg_results:
+                for key in agg_results["Well-typed"].keys():
+                    all_n_values.add(key)
+
+        # Sort n values for consistent display
+        all_n_values = sorted(
+            all_n_values,
+            key=lambda x: int(x) if isinstance(x, str) and x.isdigit() else (float("inf") if x == "Total" else x),
+        )
+
+        # Table for overall metrics
+        summary_table = Table(title="Overall Performance Metrics")
+        summary_table.add_column("Repository", style="cyan")
+
+        # Add a column for each pass@n value
+        for n in all_n_values:
+            if n != "Total":
+                summary_table.add_column(f"pass@{n}", style="green")
+
+        summary_table.add_column("System Errors", style="yellow")
+        summary_table.add_column("Empty Predictions", style="red")
+        summary_table.add_column("Tokens In/Out", style="blue")
+
+        # Calculate total nodes across all repos
+        total_nodes_all = sum(
+            repo["aggregated_results"].get("Well-typed", {}).get("Total", 0)
+            for repo in all_repos_results
+            if "aggregated_results" in repo
+        )
+
+        # Add rows for each repository
+        for repo in all_repos_results:
+            project_name = repo["project_name"]
+            agg_results = repo["aggregated_results"]
+            stats = repo["total_stats"]
+
+            # Extract metrics
+            total_nodes = agg_results.get("Well-typed", {}).get("Total", 0)
+
+            # Prepare data for the row
+            row_data = [project_name]
+
+            # Add pass@n results
+            for n in all_n_values:
+                if n == "Total":
+                    continue
+                if "Well-typed" in agg_results and n in agg_results["Well-typed"]:
+                    pass_count = agg_results["Well-typed"][n]
+                    pass_at_n = f"{(pass_count / total_nodes) * 100:.2f}%" if total_nodes > 0 else "N/A"
+                    row_data.append(f"{pass_count}/{total_nodes} ({pass_at_n})")
+                else:
+                    row_data.append("N/A")
+
+            # Add other metrics
+            system_errors = stats.get("System errors", 0)
+            system_errors_percent = (
+                f"{(system_errors / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+            )
+            row_data.append(f"{system_errors}/{total_nodes * nb_samples} ({system_errors_percent})")
+
+            empty_preds = stats.get("Empty predictions", 0)
+            empty_preds_percent = (
+                f"{(empty_preds / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+            )
+            row_data.append(f"{empty_preds}/{total_nodes * nb_samples} ({empty_preds_percent})")
+
+            tokens = f"{repo['input_tokens']}/{repo['output_tokens']}"
+            row_data.append(tokens)
+
+            summary_table.add_row(*row_data)
+
+        # Add total row
+        if total_nodes_all > 0:
+            # Initialize totals row
+            total_row = ["TOTAL"]
+
+            # Calculate aggregate pass@n metrics across all repos
+            for n in all_n_values:
+                if n == "Total":
+                    continue
+                pass_count_total = sum(
+                    repo["aggregated_results"].get("Well-typed", {}).get(n, 0)
+                    for repo in all_repos_results
+                    if "aggregated_results" in repo
+                )
+                pass_at_n_total_percent = f"{(pass_count_total / total_nodes_all) * 100:.2f}%"
+                total_row.append(f"{pass_count_total}/{total_nodes_all} ({pass_at_n_total_percent})")
+
+            # Add other total metrics
+            system_errors_total = all_repos_totals.get("System errors", 0)
+            system_errors_total_percent = f"{(system_errors_total / (total_nodes_all * nb_samples)) * 100:.2f}%"
+            total_row.append(f"{system_errors_total}/{total_nodes_all * nb_samples} ({system_errors_total_percent})")
+
+            empty_preds_total = all_repos_totals.get("Empty predictions", 0)
+            empty_preds_total_percent = f"{(empty_preds_total / (total_nodes_all * nb_samples)) * 100:.2f}%"
+            total_row.append(f"{empty_preds_total}/{total_nodes_all * nb_samples} ({empty_preds_total_percent})")
+
+            total_row.append(f"{total_input_tokens_all}/{total_output_tokens_all}")
+
+            summary_table.add_section()
+            summary_table.add_row(*total_row)
+
+        console.print(summary_table)
+
+        # Save summary to file
+        summary_output_dir = os.path.join(
+            ROOT_DIR,
+            "results",
+            "proof",
+            "summary",
+            model_name.split("/")[-1],
+            timestamp,
+        )
+        os.makedirs(summary_output_dir, exist_ok=True)
+        with open(os.path.join(summary_output_dir, "all_repos_summary.json"), "w") as f:
+            json.dump(
+                {
+                    "model": model_name,
+                    "total_nodes": total_nodes_all,
+                    "all_repos_totals": all_repos_totals,
+                    "repositories": [
+                        {
+                            "name": repo["project_name"],
+                            "pass_at_n": {
+                                n: repo["aggregated_results"].get("Well-typed", {}).get(n, 0)
+                                for n in all_n_values
+                                if n != "Total"
+                            },
+                            "total_nodes": repo["aggregated_results"].get("Well-typed", {}).get("Total", 0),
+                            "system_errors": repo["total_stats"].get("System errors", 0),
+                            "empty_predictions": repo["total_stats"].get("Empty predictions", 0),
+                            "input_tokens": repo.get("input_tokens", 0),
+                            "output_tokens": repo.get("output_tokens", 0),
+                        }
+                        for repo in all_repos_results
+                    ],
+                    "total_input_tokens": total_input_tokens_all,
+                    "total_output_tokens": total_output_tokens_all,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                f,
+                indent=2,
+            )
+
+        with open(os.path.join(summary_output_dir, "benchmark_config.yaml"), "w") as f:
+            yaml.safe_dump(benchmark_config, f)
+        with open(os.path.join(summary_output_dir, "model_config.yaml"), "w") as f:
+            yaml.safe_dump(model_config, f)
