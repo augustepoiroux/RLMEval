@@ -416,6 +416,96 @@ class ProvingEvaluation:
         if executor is not None:
             executor.shutdown(wait=False)
 
+    def recheck_predictions(
+        self,
+        source_folder: str,
+        output_folder: str,
+        nb_attempts: int,
+        verbose: bool,
+        nb_processes: int | None = 1,
+    ) -> None:
+        """Re-run the checking pipeline on previously generated predictions without calling the LLM again."""
+        blueprint_graph = nx.DiGraph()
+
+        non_null_labels = [node["label"] for node in self.blueprint_with_lean if node["label"]]
+        assert len(non_null_labels) == len(set(non_null_labels)), "Duplicate labels in the blueprint"
+
+        for node in self.blueprint_with_lean:
+            if not node["label"]:
+                continue
+            blueprint_graph.add_node(node["label"], **node)
+            for use in node.get("uses", []):
+                blueprint_graph.add_edge(use, node["label"])
+
+        # Find all nodes in the source folder that have predictions
+        predictions_to_check = []
+        for node_label in os.listdir(source_folder):
+            node_dir = os.path.join(source_folder, node_label)
+            if not os.path.isdir(node_dir):
+                continue
+
+            # Check if this is a node directory with predictions
+            completions_file = os.path.join(node_dir, "raw_completion.json")
+            if not os.path.exists(completions_file):
+                continue
+
+            if node_label not in blueprint_graph.nodes:
+                logger.warning(f"Node {node_label} not found in blueprint graph. Skipping.")
+                continue
+
+            node = blueprint_graph.nodes[node_label]
+
+            # Load the predictions from the raw completion file
+            with open(completions_file, "r") as f:
+                try:
+                    completion_data = json.load(f)
+                    if "choices" not in completion_data:
+                        logger.warning(f"Invalid completion data for node {node_label}. Skipping.")
+                        continue
+
+                    predictions = []
+                    for choice in completion_data["choices"]:
+                        content = (
+                            choice.get("message", {}).get("content") if "message" in choice else choice.get("text")
+                        )
+                        if content and content.strip():
+                            # Process the prediction based on whether it's from chat or completion API
+                            if "message" in choice:
+                                # Chat API
+                                prediction = fix_first_tactic_indentation("\n".join(extract_lean_codes(content)))
+                            else:
+                                # Completion API
+                                prediction = fix_first_tactic_indentation(content)
+                            predictions.append(prediction)
+                        else:
+                            predictions.append(None)
+
+                    if predictions:
+                        # Ensure the predictions array has exactly nb_attempts elements
+                        if len(predictions) < nb_attempts:
+                            # If we have fewer predictions than nb_attempts, pad with None
+                            predictions.extend([None] * (nb_attempts - len(predictions)))
+                        elif len(predictions) > nb_attempts:
+                            # If we have more predictions than nb_attempts, truncate
+                            predictions = predictions[:nb_attempts]
+
+                        predictions_to_check.append((node, predictions))
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON in completion file for node {node_label}. Skipping.")
+                    continue
+
+        logger.info(f"Rechecking {len(predictions_to_check)} nodes")
+
+        # Run the checking pipeline on the loaded predictions
+        self._check_predictions(
+            blueprint_graph=blueprint_graph,
+            predictions_to_check=predictions_to_check,
+            output_folder=output_folder,
+            nb_attempts=nb_attempts,
+            verbose=verbose,
+            nb_processes=nb_processes,
+        )
+
 
 def _node_informal_text(node: dict[str, Any]) -> str:
     processed_text = node["proof"]["text"]
@@ -726,6 +816,7 @@ def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[
     # deduplicate the predictions to avoid running the same code multiple times
     dedup_predictions = Counter(args.predictions)
 
+    os.makedirs(args.output_folder, exist_ok=True)
     with jsonlines.open(
         os.path.join(args.output_folder, "postprocessed_dedup_predictions.jsonl"), "w"
     ) as prediction_file:
@@ -750,7 +841,8 @@ def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[
     for i, lean_proof in enumerate(dedup_predictions):
         tmp_res.append(PredictionEvaluationResult(lean_proof=lean_proof))
 
-        if not lean_proof or "apply?" in lean_proof or "sorry" in lean_proof:
+        # fast check for incomplete proofs
+        if not lean_proof or "apply?" in lean_proof or "sorry" in lean_proof or "admit" in lean_proof:
             continue
 
         try:
@@ -783,6 +875,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate autoformalization")
     parser.add_argument("--benchmark-config", type=str, required=True, help="Path to benchmark YAML config")
     parser.add_argument("--model-config", type=str, required=True, help="Path to model YAML config")
+    parser.add_argument(
+        "--recheck-timestamp", type=str, help="Timestamp of an existing run to recheck without calling the LLM again"
+    )
     args = parser.parse_args()
 
     with open(args.benchmark_config, "r") as f:
@@ -844,8 +939,12 @@ if __name__ == "__main__":
             "proof",
             project_name_bench,
             model_name.split("/")[-1],
-            timestamp,
         )
+
+        if args.recheck_timestamp:
+            output_folder = os.path.join(output_folder, f"{args.recheck_timestamp}_recheck")
+        else:
+            output_folder = os.path.join(output_folder, timestamp)
 
         # Copy the benchmark and model config files to the result folder
         os.makedirs(output_folder, exist_ok=True)
@@ -861,53 +960,118 @@ if __name__ == "__main__":
             project_dir=lean_project_root_dir,
         )
 
-        total_input_tokens, total_output_tokens = agent.run(
-            output_folder=output_folder,
-            nb_attempts=nb_samples,
-            top_p=top_p,
-            max_total_tokens=max_total_tokens,
-            max_generated_tokens=max_generated_tokens,
-            verbose=verbose,
-            model=model_name,
-            temperature=temperature,
-            stopwords=stopwords,
-            api_key=api_key,
-            api_base_url=api_base_url,
-            use_chat_prompt=use_chat_prompt,
-            n_processes=n_processes,
-            prompt_context=prompt_context,
-            gen_processes=gen_processes,
-            nl_proof_hint=nl_proof_hint,
-        )
+        if args.recheck_timestamp:
+            source_folder = os.path.join(
+                ROOT_DIR,
+                "results",
+                "proof",
+                project_name_bench,
+                model_name.split("/")[-1],
+                args.recheck_timestamp,
+            )
 
-        # Store repo results for summary
-        try:
-            with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
-                aggregated_results = json.load(f)
-            with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
-                total_stats = json.load(f)
+            os.makedirs(output_folder, exist_ok=True)
+            with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
+                yaml.safe_dump(benchmark_config, f)
+            with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
+                yaml.safe_dump(model_config, f)
 
-            # Store results for this repo
-            repo_result = {
-                "project_name": project_name_bench,
-                "aggregated_results": aggregated_results,
-                "total_stats": total_stats,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-            }
-            all_repos_results.append(repo_result)
+            agent.recheck_predictions(
+                source_folder=source_folder,
+                output_folder=output_folder,
+                nb_attempts=nb_samples,
+                verbose=verbose,
+                nb_processes=n_processes,
+            )
 
-            # Accumulate token usage
-            total_input_tokens_all += total_input_tokens
-            total_output_tokens_all += total_output_tokens
+            # Load results for all_repos summary
+            try:
+                with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
+                    aggregated_results = json.load(f)
+                with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
+                    total_stats = json.load(f)
 
-            # Merge totals
-            for key, value in total_stats.items():
-                if key not in all_repos_totals:
-                    all_repos_totals[key] = 0
-                all_repos_totals[key] += value
-        except FileNotFoundError:
-            logger.warning(f"Results files not found for {project_name_bench}")
+                # Try to get token usage from original run
+                original_total_input = 0
+                original_total_output = 0
+                try:
+                    with open(os.path.join(source_folder, "raw_completion.json"), "r") as f:
+                        completion_data = json.load(f)
+                        if "usage" in completion_data:
+                            original_total_input = completion_data["usage"].get("prompt_tokens", 0)
+                            original_total_output = completion_data["usage"].get("completion_tokens", 0)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+
+                # Store results for this repo
+                repo_result = {
+                    "project_name": project_name_bench,
+                    "aggregated_results": aggregated_results,
+                    "total_stats": total_stats,
+                    "input_tokens": original_total_input,
+                    "output_tokens": original_total_output,
+                }
+                all_repos_results.append(repo_result)
+
+                # Merge totals for summary
+                for key, value in total_stats.items():
+                    if key not in all_repos_totals:
+                        all_repos_totals[key] = 0
+                    all_repos_totals[key] += value
+
+                # Accumulate token usage
+                total_input_tokens_all += original_total_input
+                total_output_tokens_all += original_total_output
+            except FileNotFoundError:
+                logger.warning(f"Results files not found for {project_name_bench}")
+        else:
+            total_input_tokens, total_output_tokens = agent.run(
+                output_folder=output_folder,
+                nb_attempts=nb_samples,
+                top_p=top_p,
+                max_total_tokens=max_total_tokens,
+                max_generated_tokens=max_generated_tokens,
+                verbose=verbose,
+                model=model_name,
+                temperature=temperature,
+                stopwords=stopwords,
+                api_key=api_key,
+                api_base_url=api_base_url,
+                use_chat_prompt=use_chat_prompt,
+                n_processes=n_processes,
+                prompt_context=prompt_context,
+                gen_processes=gen_processes,
+                nl_proof_hint=nl_proof_hint,
+            )
+
+            # Store repo results for summary
+            try:
+                with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
+                    aggregated_results = json.load(f)
+                with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
+                    total_stats = json.load(f)
+
+                # Store results for this repo
+                repo_result = {
+                    "project_name": project_name_bench,
+                    "aggregated_results": aggregated_results,
+                    "total_stats": total_stats,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                }
+                all_repos_results.append(repo_result)
+
+                # Accumulate token usage
+                total_input_tokens_all += total_input_tokens
+                total_output_tokens_all += total_output_tokens
+
+                # Merge totals
+                for key, value in total_stats.items():
+                    if key not in all_repos_totals:
+                        all_repos_totals[key] = 0
+                    all_repos_totals[key] += value
+            except FileNotFoundError:
+                logger.warning(f"Results files not found for {project_name_bench}")
 
     # Print summary table for all repos
     if all_repos_results:

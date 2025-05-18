@@ -445,6 +445,103 @@ class StatementAutoformalizationEvaluation:
         if executor is not None:
             executor.shutdown(wait=False)
 
+    def recheck_predictions(
+        self,
+        source_folder: str,
+        output_folder: str,
+        nb_attempts: int,
+        verbose: bool,
+        nb_processes: int | None = 1,
+    ) -> None:
+        """Re-run the checking pipeline on previously generated predictions without calling the LLM again."""
+        blueprint_graph = nx.DiGraph()
+
+        non_null_labels = [node["label"] for node in self.blueprint_with_lean if node["label"]]
+        assert len(non_null_labels) == len(set(non_null_labels)), "Duplicate labels in the blueprint"
+
+        for node in self.blueprint_with_lean:
+            if not node["label"]:
+                continue
+            blueprint_graph.add_node(node["label"], **node)
+            for use in node.get("uses", []):
+                blueprint_graph.add_edge(use, node["label"])
+
+        # Find all nodes in the source folder that have predictions
+        predictions_to_check = []
+        for node_label in os.listdir(source_folder):
+            node_dir = os.path.join(source_folder, node_label)
+            if not os.path.isdir(node_dir):
+                continue
+
+            # Check if this is a node directory with predictions
+            completions_file = os.path.join(node_dir, "raw_completion.json")
+            if not os.path.exists(completions_file):
+                continue
+
+            if node_label not in blueprint_graph.nodes:
+                logger.warning(f"Node {node_label} not found in blueprint graph. Skipping.")
+                continue
+
+            node = blueprint_graph.nodes[node_label]
+
+            # Load the predictions from the raw completion file
+            with open(completions_file, "r") as f:
+                try:
+                    completion_data = json.load(f)
+                    if "choices" not in completion_data:
+                        logger.warning(f"Invalid completion data for node {node_label}. Skipping.")
+                        continue
+
+                    predictions = []
+                    for choice in completion_data["choices"]:
+                        content = (
+                            choice.get("message", {}).get("content") if "message" in choice else choice.get("text")
+                        )
+                        if content and content.strip():
+                            # Process the prediction based on whether it's from chat or completion API
+                            if "message" in choice:
+                                # Chat API
+                                prediction = "\n\n".join(extract_lean_codes(content))
+                            else:
+                                # Completion API
+                                prediction = content
+
+                            if is_theorem(node):
+                                lean_declaration = node["lean_declarations"][0]
+                                prediction = clean_theorem_string(
+                                    prediction, new_theorem_name=lean_declaration["name"], add_sorry=True
+                                )
+
+                            predictions.append(prediction)
+                        else:
+                            predictions.append(None)
+
+                    if predictions:
+                        # Ensure the predictions array has exactly nb_attempts elements
+                        if len(predictions) < nb_attempts:
+                            # If we have fewer predictions than nb_attempts, pad with None
+                            predictions.extend([None] * (nb_attempts - len(predictions)))
+                        elif len(predictions) > nb_attempts:
+                            # If we have more predictions than nb_attempts, truncate
+                            predictions = predictions[:nb_attempts]
+
+                        predictions_to_check.append((node, predictions))
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON in completion file for node {node_label}. Skipping.")
+                    continue
+
+        logger.info(f"Rechecking {len(predictions_to_check)} nodes")
+
+        # Run the checking pipeline on the loaded predictions
+        self._check_predictions(
+            blueprint_graph=blueprint_graph,
+            predictions_to_check=predictions_to_check,
+            output_folder=output_folder,
+            nb_attempts=nb_attempts,
+            verbose=verbose,
+            nb_processes=nb_processes,
+        )
+
 
 def _node_informal_text(node: dict[str, str]) -> str:
     processed_text = node["processed_text"]
@@ -863,6 +960,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate autoformalization")
     parser.add_argument("--benchmark-config", type=str, required=True, help="Path to benchmark YAML config")
     parser.add_argument("--model-config", type=str, required=True, help="Path to model YAML config")
+    parser.add_argument(
+        "--recheck-timestamp", type=str, help="Timestamp of an existing run to recheck without calling the LLM again"
+    )
     args = parser.parse_args()
 
     with open(args.benchmark_config, "r") as f:
@@ -885,10 +985,16 @@ if __name__ == "__main__":
     prompt_context = PromptContext[model_config.get("prompt_context", "FILE_CONTEXT")]
     api_key = model_config.get("api_key", None)
     api_base_url = model_config.get("api_base_url", None)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     verbose = True
 
     traced_repos_dir = os.path.join(ROOT_DIR, "traced_repos")
+
+    all_repos_results = []
+    all_repos_totals = defaultdict(int)
+    total_input_tokens_all = 0
+    total_output_tokens_all = 0
 
     for repo in projects:
         # Construct project directory and project name using benchmark info
@@ -917,10 +1023,14 @@ if __name__ == "__main__":
             "theorems",
             project_name_bench,
             model_name.split("/")[-1],
-            datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
 
-        # Copy the benchmark and model config files to the result folder
+        if args.recheck_timestamp:
+            output_folder = os.path.join(output_folder, f"{args.recheck_timestamp}_recheck")
+        else:
+            output_folder = os.path.join(output_folder, timestamp)
+
+        os.makedirs(output_folder, exist_ok=True)
         with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
             yaml.safe_dump(benchmark_config, f)
         with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
@@ -933,20 +1043,300 @@ if __name__ == "__main__":
             project_dir=lean_project_root_dir,
         )
 
-        total_input_tokens, total_output_tokens = agent.run(
-            output_folder=output_folder,
-            nb_attempts=nb_samples,
-            top_p=top_p,
-            max_total_tokens=max_total_tokens,
-            max_generated_tokens=max_generated_tokens,
-            verbose=verbose,
-            model=model_name,
-            temperature=temperature,
-            stopwords=stopwords,
-            api_key=api_key,
-            api_base_url=api_base_url,
-            use_chat_prompt=use_chat_prompt,
-            n_processes=n_processes,
-            prompt_context=prompt_context,
-            gen_processes=gen_processes,
+        if args.recheck_timestamp:
+            source_folder = os.path.join(
+                ROOT_DIR,
+                "results",
+                "formalization",
+                "theorems",
+                project_name_bench,
+                model_name.split("/")[-1],
+                args.recheck_timestamp,
+            )
+
+            if not os.path.exists(source_folder):
+                logger.error(f"Source folder not found: {source_folder}")
+                continue
+
+            os.makedirs(output_folder, exist_ok=True)
+            with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
+                yaml.safe_dump(benchmark_config, f)
+            with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
+                yaml.safe_dump(model_config, f)
+
+            agent.recheck_predictions(
+                source_folder=source_folder,
+                output_folder=output_folder,
+                nb_attempts=nb_samples,
+                verbose=verbose,
+                nb_processes=n_processes,
+            )
+
+            # Load results for all_repos summary
+            try:
+                with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
+                    aggregated_results = json.load(f)
+                with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
+                    total_stats = json.load(f)
+
+                # Try to get token usage from original run
+                original_total_input = 0
+                original_total_output = 0
+                try:
+                    with open(os.path.join(source_folder, "raw_completion.json"), "r") as f:
+                        completion_data = json.load(f)
+                        if "usage" in completion_data:
+                            original_total_input = completion_data["usage"].get("prompt_tokens", 0)
+                            original_total_output = completion_data["usage"].get("completion_tokens", 0)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+
+                # Store results for this repo
+                repo_result = {
+                    "project_name": project_name_bench,
+                    "aggregated_results": aggregated_results,
+                    "total_stats": total_stats,
+                    "input_tokens": original_total_input,
+                    "output_tokens": original_total_output,
+                }
+                all_repos_results.append(repo_result)
+
+                # Merge totals for summary
+                for key, value in total_stats.items():
+                    if key not in all_repos_totals:
+                        all_repos_totals[key] = 0
+                    all_repos_totals[key] += value
+
+                # Accumulate token usage
+                total_input_tokens_all += original_total_input
+                total_output_tokens_all += original_total_output
+            except FileNotFoundError:
+                logger.warning(f"Results files not found for {project_name_bench}")
+        else:
+            total_input_tokens, total_output_tokens = agent.run(
+                output_folder=output_folder,
+                nb_attempts=nb_samples,
+                top_p=top_p,
+                max_total_tokens=max_total_tokens,
+                max_generated_tokens=max_generated_tokens,
+                verbose=verbose,
+                model=model_name,
+                temperature=temperature,
+                stopwords=stopwords,
+                api_key=api_key,
+                api_base_url=api_base_url,
+                use_chat_prompt=use_chat_prompt,
+                n_processes=n_processes,
+                prompt_context=prompt_context,
+                gen_processes=gen_processes,
+            )
+
+            # Store repo results for summary
+            try:
+                with open(os.path.join(output_folder, "aggregated_results.json"), "r") as f:
+                    aggregated_results = json.load(f)
+                with open(os.path.join(output_folder, "total_stats.json"), "r") as f:
+                    total_stats = json.load(f)
+
+                # Store results for this repo
+                repo_result = {
+                    "project_name": project_name_bench,
+                    "aggregated_results": aggregated_results,
+                    "total_stats": total_stats,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                }
+                all_repos_results.append(repo_result)
+
+                # Accumulate token usage
+                total_input_tokens_all += total_input_tokens
+                total_output_tokens_all += total_output_tokens
+
+                # Merge totals
+                for key, value in total_stats.items():
+                    if key not in all_repos_totals:
+                        all_repos_totals[key] = 0
+                    all_repos_totals[key] += value
+            except FileNotFoundError:
+                logger.warning(f"Results files not found for {project_name_bench}")
+
+    # Print summary table for all repos
+    if all_repos_results:
+        console.rule(f"Summary of All Repositories - {model_name}")
+
+        # Find all n values and metrics present in any repo's results
+        all_n_values = set()
+        all_metrics = set()
+        for repo in all_repos_results:
+            agg_results = repo.get("aggregated_results", {})
+            for metric_key in agg_results:
+                all_metrics.add(metric_key)
+                for n_value in agg_results[metric_key].keys():
+                    if n_value != "Total":
+                        all_n_values.add(n_value)
+
+        # Add selection methods to n_values
+        selection_methods = ["Random", "Majority vote", "Self-BLEU"]
+        for method in selection_methods:
+            if any(
+                method in repo.get("aggregated_results", {}).get(list(repo.get("aggregated_results", {}).keys())[0], {})
+                for repo in all_repos_results
+                if repo.get("aggregated_results")
+            ):
+                all_n_values.add(method)
+
+        # Sort n values for consistent display
+        all_n_values = sorted(
+            all_n_values,
+            key=lambda x: (not isinstance(x, int), x)
+            if isinstance(x, (int, str)) and (isinstance(x, int) or x.isdigit())
+            else float("inf"),
         )
+
+        # Sort metrics for consistent display
+        metric_order = {"Well-typed": 0, "BEqL": 1, "BEq+": 2}
+        all_metrics = sorted(all_metrics, key=lambda x: metric_order.get(x, float("inf")))
+
+        # Table for well-typed metrics
+        for metric in all_metrics:
+            metric_table = Table(title=f"{metric} Performance Metrics")
+            metric_table.add_column("Repository", style="cyan")
+
+            # Add a column for each pass@n value
+            for n in all_n_values:
+                metric_table.add_column(f"pass@{n}" if isinstance(n, int) else n, style="green")
+
+            metric_table.add_column("System Errors", style="red")
+            metric_table.add_column("Empty Predictions", style="yellow")
+            metric_table.add_column("Tokens In/Out", style="blue")
+
+            # Calculate total nodes across all repos for this metric
+            metric_total_nodes = sum(
+                repo["aggregated_results"].get(metric, {}).get("Total", 0)
+                for repo in all_repos_results
+                if "aggregated_results" in repo
+            )
+
+            # Add rows for each repository
+            for repo in all_repos_results:
+                project_name = repo["project_name"]
+                agg_results = repo["aggregated_results"]
+                stats = repo["total_stats"]
+
+                # Extract metrics
+                total_nodes = agg_results.get(metric, {}).get("Total", 0)
+
+                # Prepare data for the row
+                row_data = [project_name]
+
+                # Add pass@n results
+                for n in all_n_values:
+                    if metric in agg_results and n in agg_results[metric]:
+                        pass_count = agg_results[metric][n]
+                        pass_at_n = f"{(pass_count / total_nodes) * 100:.2f}%" if total_nodes > 0 else "N/A"
+                        row_data.append(f"{int(pass_count)}/{total_nodes} ({pass_at_n})")
+                    else:
+                        row_data.append("N/A")
+
+                # Add other metrics
+                system_errors = stats.get("System errors", 0)
+                system_errors_percent = (
+                    f"{(system_errors / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+                )
+                row_data.append(f"{system_errors}/{total_nodes * nb_samples} ({system_errors_percent})")
+
+                empty_preds = stats.get("Empty predictions", 0)
+                empty_preds_percent = (
+                    f"{(empty_preds / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+                )
+                row_data.append(f"{empty_preds}/{total_nodes * nb_samples} ({empty_preds_percent})")
+
+                tokens = f"{repo['input_tokens']}/{repo['output_tokens']}"
+                row_data.append(tokens)
+
+                metric_table.add_row(*row_data)
+
+            # Add total row
+            if metric_total_nodes > 0:
+                # Initialize totals row
+                total_row = ["TOTAL"]
+
+                # Calculate aggregate pass@n metrics across all repos
+                for n in all_n_values:
+                    pass_count_total = sum(
+                        repo["aggregated_results"].get(metric, {}).get(n, 0)
+                        for repo in all_repos_results
+                        if "aggregated_results" in repo
+                    )
+                    pass_at_n_total_percent = f"{(pass_count_total / metric_total_nodes) * 100:.2f}%"
+                    total_row.append(f"{int(pass_count_total)}/{metric_total_nodes} ({pass_at_n_total_percent})")
+
+                # Add other total metrics
+                system_errors_total = all_repos_totals.get("System errors", 0)
+                system_errors_total_percent = f"{(system_errors_total / (metric_total_nodes * nb_samples)) * 100:.2f}%"
+                total_row.append(
+                    f"{system_errors_total}/{metric_total_nodes * nb_samples} ({system_errors_total_percent})"
+                )
+
+                empty_preds_total = all_repos_totals.get("Empty predictions", 0)
+                empty_preds_total_percent = f"{(empty_preds_total / (metric_total_nodes * nb_samples)) * 100:.2f}%"
+                total_row.append(f"{empty_preds_total}/{metric_total_nodes * nb_samples} ({empty_preds_total_percent})")
+
+                total_row.append(f"{total_input_tokens_all}/{total_output_tokens_all}")
+
+                metric_table.add_section()
+                metric_table.add_row(*total_row)
+
+            console.print(metric_table)
+
+        # Save summary to file
+        summary_output_dir = os.path.join(
+            ROOT_DIR,
+            "results",
+            "formalization",
+            "theorems",
+            "summary",
+            model_name.split("/")[-1],
+            datetime.now().strftime("%Y%m%d_%H%M%S"),
+        )
+        os.makedirs(summary_output_dir, exist_ok=True)
+        with open(os.path.join(summary_output_dir, "all_repos_summary.json"), "w") as f:
+            json.dump(
+                {
+                    "model": model_name,
+                    "total_metrics": {
+                        metric: sum(
+                            repo["aggregated_results"].get(metric, {}).get("Total", 0)
+                            for repo in all_repos_results
+                            if "aggregated_results" in repo
+                        )
+                        for metric in all_metrics
+                    },
+                    "all_repos_totals": all_repos_totals,
+                    "repositories": [
+                        {
+                            "name": repo["project_name"],
+                            "metrics": {
+                                metric: {n: repo["aggregated_results"].get(metric, {}).get(n, 0) for n in all_n_values}
+                                for metric in all_metrics
+                            },
+                            "total_nodes": repo["aggregated_results"].get("Well-typed", {}).get("Total", 0),
+                            "system_errors": repo["total_stats"].get("System errors", 0),
+                            "empty_predictions": repo["total_stats"].get("Empty predictions", 0),
+                            "input_tokens": repo.get("input_tokens", 0),
+                            "output_tokens": repo.get("output_tokens", 0),
+                        }
+                        for repo in all_repos_results
+                    ],
+                    "total_input_tokens": total_input_tokens_all,
+                    "total_output_tokens": total_output_tokens_all,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                f,
+                indent=2,
+            )
+
+        with open(os.path.join(summary_output_dir, "benchmark_config.yaml"), "w") as f:
+            yaml.safe_dump(benchmark_config, f)
+        with open(os.path.join(summary_output_dir, "model_config.yaml"), "w") as f:
+            yaml.safe_dump(model_config, f)
