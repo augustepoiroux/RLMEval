@@ -316,6 +316,7 @@ class ProvingEvaluation:
             total_nodes += 1
 
             # dump validity results to a file
+            os.makedirs(os.path.join(output_folder, node_label), exist_ok=True)
             with jsonlines.open(os.path.join(output_folder, node_label, "validity_results.jsonl"), "w") as results_file:
                 results_file.write_all(dataclasses.asdict(result) for result in validity_results)
 
