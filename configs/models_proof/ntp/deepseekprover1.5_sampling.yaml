@@ -1,4 +1,4 @@
-model: "hosted_vllm/deepseek-ai/DeepSeek-Prover-V2-7B"
+model: "hosted_vllm/deepseek-ai/DeepSeek-Prover-V1.5-RL"
 temperature: 1.0
 top_p: 0.95
 nb_samples: 128
@@ -9,9 +9,9 @@ stopwords:
   - "```"
   - "sorry"
   - "\n\n"
-n_processes: 50
-gen_processes: 20
+n_processes: 20
+gen_processes: 5
 prompt_context: "FILE_CONTEXT"
-nl_proof_hint: true
+nl_proof_hint: false
 api_key: "-"
 api_base_url: "http://localhost:8080/v1"

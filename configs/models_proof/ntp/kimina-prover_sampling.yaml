@@ -12,6 +12,6 @@ stopwords:
 n_processes: 50
 gen_processes: 20
 prompt_context: "FILE_CONTEXT"
-nl_proof_hint: true
+nl_proof_hint: false
 api_key: "-"
 api_base_url: "http://localhost:8080/v1"
