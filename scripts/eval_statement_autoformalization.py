@@ -1297,8 +1297,13 @@ if __name__ == "__main__":
             "theorems",
             "summary",
             model_name.split("/")[-1],
-            datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
+
+        if args.recheck_timestamp:
+            summary_output_dir = os.path.join(summary_output_dir, f"{args.recheck_timestamp}_recheck")
+        else:
+            summary_output_dir = os.path.join(summary_output_dir, timestamp)
+
         os.makedirs(summary_output_dir, exist_ok=True)
         with open(os.path.join(summary_output_dir, "all_repos_summary.json"), "w") as f:
             json.dump(
@@ -1330,7 +1335,7 @@ if __name__ == "__main__":
                     ],
                     "total_input_tokens": total_input_tokens_all,
                     "total_output_tokens": total_output_tokens_all,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": timestamp,
                 },
                 f,
                 indent=2,
