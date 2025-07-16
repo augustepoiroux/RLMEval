@@ -30,9 +30,13 @@ Prepare the RLM25 dataset:
 
     python scripts/extract_benchmark.py  --config configs/benchmark/rlm25.yaml
 
-Run the evaluation:
+Run statement autoformalization evaluation:
 
     python scripts/eval_statement_autoformalization.py --benchmark-config configs/benchmark/rlm25.yaml --model-config configs/models/gpt-4o_greedy.yaml
+
+Run proof autoformalization evaluation:
+
+    python scripts/eval_proof_autoformalization.py --benchmark-config configs/benchmark/rlm25.yaml --model-config configs/models_proof/gpt-4o_greedy.yaml
 
 ## Citation
 

@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 import jsonlines
 import litellm
@@ -14,7 +15,7 @@ import networkx as nx
 import yaml
 from lean_interact import AutoLeanServer, LeanREPLConfig, LocalProject
 from lean_interact.interface import Command, LeanError
-from lean_interact.utils import clean_theorem_string
+from lean_interact.utils import indent_code
 from litellm import completion, text_completion
 from litellm.caching.caching import Cache, LiteLLMCacheType
 from litellm.exceptions import ContextWindowExceededError
@@ -25,9 +26,7 @@ from rich.table import Table
 from tqdm import tqdm
 
 from rlm_eval.data_processing.lean_utils import LeanFilesProcessor, trim_comments_end
-from rlm_eval.metrics.beq_plus import BEqCPUResult, check_theorem_equivalence
 from rlm_eval.utils import (
-    DATA_DIR,
     ROOT_DIR,
     clean_messages,
     console,
@@ -35,19 +34,43 @@ from rlm_eval.utils import (
     generate_n_samples_sequence,
     logger,
     optional_status,
-    self_consistency,
 )
 
 litellm.cache = Cache(type=LiteLLMCacheType.DISK, disk_cache_dir=os.path.join(ROOT_DIR, ".cache", "litellm"))
 
 
 class PromptContext(Enum):
-    PROOFNET_FEW_SHOT = "proofnet_few_shot"
+    NO_CONTEXT = "no_context"
     FILE_CONTEXT = "file_context"
-    ZERO_SHOT_FINETUNED = "none"
+    FILE_CONTEXT_NO_LEMMAS = "file_context_no_lemmas"
 
 
-class StatementAutoformalizationEvaluation:
+def fix_first_tactic_indentation(lean_proof: str) -> str:
+    """
+    Sets the indentation of the first tactic line to the minimum indentation
+    found among all subsequent non-empty lines.
+    Some LLMs do not align correctly the first tactic, hence this function.
+    """
+    if not lean_proof:
+        return lean_proof
+    lines = lean_proof.splitlines()
+
+    # Find minimum indentation among all subsequent non-empty lines
+    min_indent = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() != "":
+            indent = len(lines[idx]) - len(lines[idx].lstrip())
+            if min_indent is None or indent < min_indent:
+                min_indent = indent
+    if min_indent is None:
+        return lean_proof  # Only one tactic, nothing to align to
+
+    # Rebuild lines, fixing the first tactic's indentation
+    lines[0] = indent_code(lines[0].lstrip(), min_indent)
+    return "\n".join(lines)
+
+
+class ProvingEvaluation:
     def __init__(
         self,
         blueprint_with_lean: list[dict],
@@ -80,6 +103,7 @@ class StatementAutoformalizationEvaluation:
         n_processes: int | None = 1,
         prompt_context: PromptContext = PromptContext.FILE_CONTEXT,
         gen_processes: int | None = None,
+        nl_proof_hint: bool = True,
     ) -> tuple[int, int]:
         # first build the DAG of the blueprint
         blueprint_graph = nx.DiGraph()
@@ -96,7 +120,7 @@ class StatementAutoformalizationEvaluation:
 
         total_input_tokens, total_output_tokens = 0, 0
 
-        # instantiate list of statements that are eligible for formalization
+        # instantiate list of statements that are eligible for proving
         node_labels = list(reversed(list(nx.topological_sort(blueprint_graph))))
         eligible_node_labels = []
         for node_label in node_labels:
@@ -104,10 +128,14 @@ class StatementAutoformalizationEvaluation:
             if "lean_declarations" not in node:
                 logger.info(f"Skipping {node_label}: no Lean declarations found.")
                 continue
-            if not is_theorem(node):
-                logger.info(f"Skipping {node_label}: not a theorem.")
+            if "proof" not in node or "text" not in node["proof"]:
+                logger.info(f"Skipping {node_label}: no informal proof found.")
                 continue
-            lean_declarations_with_file = [lean_decl for lean_decl in node["lean_declarations"] if "file" in lean_decl]
+            lean_declarations_with_file = [
+                lean_decl
+                for lean_decl in node["lean_declarations"]
+                if "file" in lean_decl and "theorem_info" in lean_decl
+            ]
             if len(lean_declarations_with_file) > 1:
                 logger.info(
                     f"Skipping {node_label}: multiple Lean declarations per node is not yet supported for evaluation."
@@ -119,10 +147,10 @@ class StatementAutoformalizationEvaluation:
             eligible_node_labels.append(node_label)
 
         # eligible_node_labels = eligible_node_labels[:5]
-        logger.info(f"Formalizing {len(eligible_node_labels)} theorems")
+        logger.info(f"Proving {len(eligible_node_labels)} theorems")
 
-        # Function to formalize a single node
-        def formalize_node_wrapper(
+        # Function to prove a single node
+        def prove_node_wrapper(
             node_label,
             blueprint_graph=blueprint_graph,
             lean_files=self.lean_files,
@@ -140,11 +168,12 @@ class StatementAutoformalizationEvaluation:
             max_generated_tokens=max_generated_tokens,
             max_total_tokens=max_total_tokens,
             prompt_context=prompt_context,
+            nl_proof_hint=nl_proof_hint,
             console=console,
         ):
             node = blueprint_graph.nodes[node_label]
             try:
-                predictions, input_tokens, output_tokens = _formalize_node(
+                predictions, input_tokens, output_tokens = _prove_node(
                     node=node,
                     blueprint_graph=blueprint_graph,
                     lean_files=lean_files,
@@ -162,6 +191,7 @@ class StatementAutoformalizationEvaluation:
                     max_generated_tokens=max_generated_tokens,
                     max_total_tokens=max_total_tokens,
                     prompt_context=prompt_context,
+                    nl_proof_hint=nl_proof_hint,
                     console=console,
                 )
                 return node, predictions, input_tokens, output_tokens, None
@@ -174,21 +204,20 @@ class StatementAutoformalizationEvaluation:
             with concurrent.futures.ThreadPoolExecutor(max_workers=gen_processes) as executor:
                 logger.info(f"Using {gen_processes} threads for proof generation")
                 futures = [
-                    executor.submit(formalize_node_wrapper, node_label, verbose=False)
+                    executor.submit(prove_node_wrapper, node_label, verbose=False)
                     for node_label in eligible_node_labels
                 ]
                 for future in tqdm(
-                    concurrent.futures.as_completed(futures), total=len(futures), desc="Formalizing theorems"
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Generating proofs"
                 ):
                     if future.exception() is not None:
-                        logger.error(f"Error while formalizing a node: {future.exception()}")
+                        logger.error(f"Error while proving a node: {future.exception()}")
                     else:
                         results.append(future.result())
         else:
             # Standard sequential processing
             results = [
-                formalize_node_wrapper(node_label)
-                for node_label in tqdm(eligible_node_labels, desc="Formalizing theorems")
+                prove_node_wrapper(node_label) for node_label in tqdm(eligible_node_labels, desc="Generating proofs")
             ]
 
         # Process results
@@ -253,7 +282,7 @@ class StatementAutoformalizationEvaluation:
             iterator = (
                 future.result()
                 if not future.exception()
-                else (None, "", [PredictionEvaluationResult(lean_code=None, error=str(future.exception()))])
+                else (None, "", [PredictionEvaluationResult(lean_proof=None, error=str(future.exception()))])
                 for future in concurrent.futures.as_completed(futures)
             )
         else:
@@ -261,17 +290,21 @@ class StatementAutoformalizationEvaluation:
             iterator = map(_process_predictions, args_list)
 
         if verbose:
-            iterator = tqdm(iterator, total=len(args_list), desc="Processing predictions")
+            iterator = tqdm(iterator, total=len(args_list), desc="Checking proofs")
 
-        aggregated_check_results = defaultdict(lambda: defaultdict(float))
-        pass_n_seq = generate_n_samples_sequence(nb_attempts)
+        aggregated_check_results = defaultdict(lambda: defaultdict(int))
+        pass_n_seq = generate_n_samples_sequence(nb_attempts, sequence_type="pow2")
 
         # Initialize counters for averages
         total_nodes = 0
-        total_thm_nodes = 0
         totals = defaultdict(int)
+        totals |= {
+            "Well-typed": 0,
+            "System errors": 0,
+            "Empty predictions": 0,
+        }
         errors_collection = []
-        for node_label, decl_ground_truth, validity_results in iterator:
+        for node_label, decl, validity_results in iterator:
             if node_label is None:
                 # it means that an exception was raised
                 errors_collection.append((node_label, validity_results[0].error))
@@ -281,86 +314,37 @@ class StatementAutoformalizationEvaluation:
 
             # Update counters
             total_nodes += 1
-            if is_theorem(node):
-                total_thm_nodes += 1
 
             # dump validity results to a file
+            os.makedirs(os.path.join(output_folder, node_label), exist_ok=True)
             with jsonlines.open(os.path.join(output_folder, node_label, "validity_results.jsonl"), "w") as results_file:
                 results_file.write_all(dataclasses.asdict(result) for result in validity_results)
 
             if verbose:
                 console.rule(f"Formalization result for node {node_label}")
-                console.print(f"Is theorem: {is_theorem(node)}")
                 console.print(
                     Panel(Syntax(node["processed_text"], "latex", word_wrap=True), title="LaTeX code to formalize")
                 )
                 console.print(
                     Panel(
-                        Syntax(decl_ground_truth, "lean4", word_wrap=True, line_numbers=True),
+                        Syntax(decl, "lean4", word_wrap=True, line_numbers=True),
                         title="Ground truth",
                     )
                 )
 
-            lean_codes = [result.lean_code for result in validity_results if result.lean_code is not None]
-            well_typed_lean_codes: list[str] = [result.lean_code for result in validity_results if result.well_typed]  # type: ignore
-            assert all(code is not None for code in well_typed_lean_codes)
-
-            selected_lean_codes = {}
-
-            if len(well_typed_lean_codes) == 0:
-                console.print(f"\u274c Node `{node_label}`: none of the predictions are well-typed")
-
-                if lean_codes:
-                    selected_lean_codes = {
-                        "Random": lean_codes[0],
-                        "Majority vote": Counter(lean_codes).most_common(1)[0][0],
-                        "Self-BLEU": self_consistency(lean_codes),
-                    }
-            else:
-                console.print(
-                    f"\u2705 Node `{node_label}`: {len(well_typed_lean_codes)} well-typed formalization{'s' if len(well_typed_lean_codes) > 1 else ''}"
-                )
-
-                # Select the best formalization attempt using self-consistency
-                selected_lean_codes = {
-                    "Random": well_typed_lean_codes[0],
-                    "Majority vote": Counter(well_typed_lean_codes).most_common(1)[0][0],
-                    "Self-BLEU": self_consistency(well_typed_lean_codes),
-                }
-
-            if verbose:
-                for key, selected_lean_code in selected_lean_codes.items():
-                    console.print(
-                        Panel(
-                            Syntax(selected_lean_code, "lean4", word_wrap=True, line_numbers=True),
-                            title=f"Selected formalization ({key})",
-                        )
-                    )
-
-            check_results = defaultdict(lambda: defaultdict(float))
+            check_results = defaultdict(lambda: defaultdict(int))
 
             def update_dict(key, result: PredictionEvaluationResult, target_dict: dict) -> None:
-                target_dict["Well-typed"][key] = max(target_dict["Well-typed"].get(key, 0), float(result.well_typed))
-
-                if result.beq_result:
-                    target_dict["BEqL"][key] = max(
-                        target_dict["BEqL"].get(key, 0),
-                        float(result.beq_result.beql()),
-                    )
-                    target_dict["BEq+"][key] = max(target_dict["BEq+"].get(key, 0), float(result.beq_result.beq_plus()))
+                target_dict["Well-typed"][key] = max(target_dict["Well-typed"].get(key, 0), result.well_typed)
 
             assert len(validity_results) == nb_attempts
             pass_n_seq_iter = iter(pass_n_seq)
             next_n = next(pass_n_seq_iter)
-            cumulative_results = defaultdict(lambda: defaultdict(float))
+            cumulative_results = defaultdict(lambda: defaultdict(int))
             for idx_res, result in enumerate(validity_results):
-                for key, selected_lean_code in selected_lean_codes.items():
-                    if result.lean_code == selected_lean_code:
-                        update_dict(key, result, check_results)
-
                 # Update cumulative results
                 update_dict(None, result, cumulative_results)
-                for key in check_results:
+                for key in cumulative_results:
                     check_results[key][next_n] = cumulative_results[key][None]
 
                 if idx_res + 1 == next_n and next_n != nb_attempts:
@@ -370,11 +354,7 @@ class StatementAutoformalizationEvaluation:
 
             # aggregate the results
             for key in set(aggregated_check_results.keys()).union(check_results.keys()):
-                total = {
-                    "Well-typed": total_nodes,
-                    "BEqL": total_thm_nodes,
-                    "BEq+": total_thm_nodes,
-                }[key]
+                total = {"Well-typed": total_nodes}[key]
                 aggregated_check_results[key]["Total"] = total
                 if key not in check_results:
                     continue
@@ -382,14 +362,14 @@ class StatementAutoformalizationEvaluation:
                     aggregated_check_results[key][n_samples] += res
 
             # print stats so far with and without percentage
-            table = Table(title="Formalization stats")
+            table = Table(title="Proof stats")
             table.add_column("Metric", style="cyan")
             table.add_column("Total", style="green")
             table.add_column("Percentage", style="green")
             for key in aggregated_check_results:
                 table.add_row(key, "", "")
                 total = int(aggregated_check_results[key]["Total"])
-                for n_sample in pass_n_seq + list(selected_lean_codes.keys()):
+                for n_sample in pass_n_seq:
                     count = aggregated_check_results[key][n_sample]
                     percentage = (count / total) if total > 0 else 0
                     table.add_row(
@@ -404,14 +384,10 @@ class StatementAutoformalizationEvaluation:
             for result in validity_results:
                 if result.well_typed:
                     totals["Well-typed"] += 1
-                    if result.beq_result and result.beq_result.beql():
-                        totals["BEqL"] += 1
-                    if result.beq_result and result.beq_result.beq_plus():
-                        totals["BEq+"] += 1
                 if result.error:
                     totals["System errors"] += 1
                     errors_collection.append((node_label, result.error))
-                if result.lean_code is None:
+                if result.lean_proof is None:
                     totals["Empty predictions"] += 1
 
             # Print averages
@@ -420,11 +396,7 @@ class StatementAutoformalizationEvaluation:
             table.add_column("Total", style="green")
             table.add_column("Percentage", style="green")
             for key in totals:
-                total = (
-                    total_nodes
-                    if key in ["Well-typed", "Replace-compiles", "System errors", "Empty predictions"]
-                    else total_thm_nodes
-                ) * nb_attempts
+                total = total_nodes * nb_attempts
                 count = totals[key]
                 percentage = (count / total) if total > 0 else 0
                 table.add_row(key, f"{count}/{total}", f"{percentage:.2%}")
@@ -501,17 +473,10 @@ class StatementAutoformalizationEvaluation:
                             # Process the prediction based on whether it's from chat or completion API
                             if "message" in choice:
                                 # Chat API
-                                prediction = "\n\n".join(extract_lean_codes(content))
+                                prediction = fix_first_tactic_indentation("\n".join(extract_lean_codes(content)))
                             else:
                                 # Completion API
-                                prediction = content
-
-                            if is_theorem(node):
-                                lean_declaration = node["lean_declarations"][0]
-                                prediction = clean_theorem_string(
-                                    prediction, new_theorem_name=lean_declaration["name"], add_sorry=True
-                                )
-
+                                prediction = fix_first_tactic_indentation(content)
                             predictions.append(prediction)
                         else:
                             predictions.append(None)
@@ -543,18 +508,18 @@ class StatementAutoformalizationEvaluation:
         )
 
 
-def _node_informal_text(node: dict[str, str]) -> str:
-    processed_text = node["processed_text"]
+def _node_informal_text(node: dict[str, Any]) -> str:
+    processed_text = node["proof"]["text"]
     return "\n".join(line.strip() for line in processed_text.split(r"\\") if line.strip())
 
 
-def _node_informal_comment(node: dict[str, str], lean_name: str) -> str:
-    processed_text = node["processed_text"]
+def _node_informal_comment(node: dict[str, Any]) -> str:
+    processed_text = node["proof"]["text"]
     processed_text = "\n".join(line.strip() for line in processed_text.split(r"\\") if line.strip())
-    return f"/- {node['stmt_type'].capitalize()} `{lean_name}`\n{processed_text}\n-/"
+    return f"/- {processed_text}\n-/"
 
 
-def _formalize_node(
+def _prove_node(
     node: dict,
     blueprint_graph: nx.DiGraph,
     lean_files: dict,
@@ -572,19 +537,20 @@ def _formalize_node(
     max_total_tokens: int,
     max_generated_tokens: int,
     prompt_context: PromptContext,
+    nl_proof_hint: bool,
     console=console,
 ) -> tuple[list[str | None], int, int]:
     # prepare prompt context
     lean_declaration = node["lean_declarations"][0]
     original_file_content: str = lean_files[lean_declaration["file"]]
-    original_lean_context = original_file_content[: lean_declaration["start_idx"]]
+    original_lean_context = original_file_content[: lean_declaration["theorem_info"]["proof_start_idx"]]
 
     def compress_lean_context(lean_context: str, level: int = 0) -> str:
         if level == -1:
             return ""
-        if level >= 0:
-            lean_context = LeanFilesProcessor(lean_declarations).remove_proofs(lean_declaration["file"], lean_context)
-            # lean_context = LeanFilesProcessor(lean_declarations).remove_theorems(lean_declaration["file"], lean_context)
+        # if level >= 0:
+        #     lean_context = LeanFilesProcessor(lean_declarations).remove_proofs(lean_declaration["file"], lean_context)
+        #     # lean_context = LeanFilesProcessor(lean_declarations).remove_theorems(lean_declaration["file"], lean_context)
         if level >= 2:
             # remove lines in the middle of the context
             lines = lean_context.split("\n")
@@ -600,83 +566,89 @@ def _formalize_node(
 
     max_input_tokens = int(0.8 * (max_total_tokens - max_generated_tokens))
 
-    prefix_decl = ""
-    if is_theorem(node):
-        prefix_decl = f"\ntheorem {lean_declaration['name']}"
+    with optional_status(f"Generating proofs for node {node['label']}...", enabled=verbose):
+        # Helper functions for prompt generation
+        def create_prompt_for_context(lean_context: str, context_type: PromptContext, level: int = 0) -> str:
+            """Create prompt text based on the context type."""
+            if context_type == PromptContext.NO_CONTEXT:
+                return f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:"
 
-    with optional_status(f"Generating formalizations for node {node['label']}...", enabled=verbose):
+            # Apply compression to lean_context based on level
+            compressed_lean_context = compress_lean_context(lean_context, level=level)
+
+            # Get blueprint lemmas for NO_LEMMAS contexts
+            if context_type == PromptContext.FILE_CONTEXT_NO_LEMMAS:
+                # Get all lemma names from the blueprint graph
+                blueprint_lemmas = set()
+                for blueprint_node in blueprint_graph.nodes():
+                    node_data = blueprint_graph.nodes[blueprint_node]
+                    if "lean_declarations" in node_data:
+                        for lean_decl in node_data["lean_declarations"]:
+                            if "full_name" in lean_decl:
+                                blueprint_lemmas.add(lean_decl["full_name"])
+
+                # Process the context by removing proofs and non-blueprint lemmas
+                lean_processor = LeanFilesProcessor(lean_declarations)
+                compressed_lean_context = lean_processor.remove_theorems(
+                    lean_declaration["file"], compressed_lean_context, whitelist=blueprint_lemmas
+                )
+
+            # Format the prompt based on whether it's chat or completion
+            if use_chat_prompt:
+                prompt = "Here is the Lean 4 context:\n```lean4\n" + compressed_lean_context.strip() + " := by\n```"
+                if nl_proof_hint:
+                    prompt += "\n\nUsing this context, formalize the following proof into Lean 4.\n"
+                    prompt += f"```lean4\n{_node_informal_comment(node)}```"
+                else:
+                    prompt += "\n\nUsing this context, prove the last statement in Lean 4."
+                prompt += "\nStart your response like this:\n```lean4\n:= by"
+            else:
+                lean_code = compressed_lean_context.strip() + " := by\n"
+                if nl_proof_hint:
+                    lean_code += indent_code(_node_informal_comment(node), 2)
+                prompt = (
+                    "Complete the following Lean 4 code with explanatory comments preceding each line of code:\n\n```lean4\n"
+                    + lean_code
+                ).strip()
+
+            return prompt
+
+        def find_appropriate_compression_level(
+            input_text: str, counter_func, max_tokens: int
+        ) -> tuple[int, dict[str, list[dict[str, str]] | str]]:
+            """Find an appropriate compression level and return the level and processed text."""
+            for level in range(16):  # Try compression levels 0-15
+                processed_text = counter_func(input_text, level)
+                if processed_text and token_counter(model=model, **processed_text) <= max_tokens:
+                    return level, processed_text
+
+            # If all compression attempts fail, try level -1 (no context)
+            level = -1
+            processed_text = counter_func(input_text, level)
+            return level, processed_text
+
+        # Process based on whether we're using chat or completion API
         if use_chat_prompt:
-            match prompt_context:
-                case PromptContext.PROOFNET_FEW_SHOT:
-                    with jsonlines.open(os.path.join(DATA_DIR, "8_shot_proofnet_lean4.jsonl")) as f:
-                        proofnet_few_shot = list(f)
-                    template_few_shot = "Natural language version:\n{nl_statement}\nTranslate the natural language version to a Lean 4 version:"
-                    messages = []
-                    for proofnet in proofnet_few_shot:
-                        messages.append(
-                            {"role": "user", "content": template_few_shot.format(nl_statement=proofnet["nl_statement"])}
-                        )
-                        messages.append({"role": "assistant", "content": proofnet["formal_statement"]})
-                    messages.append(
-                        {"role": "user", "content": template_few_shot.format(nl_statement=_node_informal_text(node))}
-                    )
-                    compress_level = 0
+            # Function to prepare messages at a specific compression level
+            def prepare_messages(context: str, level: int) -> dict[str, list[dict[str, str]]]:
+                prompt = create_prompt_for_context(context, prompt_context, level)
+                return {"messages": clean_messages([{"role": "user", "content": prompt}])}
 
-                case PromptContext.FILE_CONTEXT:
+            if prompt_context == PromptContext.NO_CONTEXT:
+                compress_level = 0
+                messages = prepare_messages("", compress_level)
+            else:
+                # Find appropriate compression level
+                compress_level, messages = find_appropriate_compression_level(
+                    original_lean_context, prepare_messages, max_input_tokens
+                )
+            assert isinstance(messages["messages"], list)
 
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        lean_context = compress_lean_context(lean_context, level=level)
-                        prompt = "Here is the Lean 4 context:\n```lean4\n" + lean_context.strip() + "\n```"
-                        prompt += "\n\nUsing this context, translate the following problem into Lean4 code (only the core declaration, using `sorry` as proof).\n"
-                        prompt += f"```lean4\n{_node_informal_comment(node, lean_declaration['name'])}```"
-                        if prefix_decl:
-                            prompt += f"\nStart your formalization like this:\n```lean4\n{prefix_decl}"
-                        return prompt
+            if not messages or token_counter(model=model, **messages) > max_input_tokens:  # type: ignore
+                logger.warning(f"Natural language context too large for node {node['label']}. Skipping formalization.")
+                return [None for _ in range(nb_attempts)], 0, 0
 
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try
-                    messages = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) <= max_input_tokens:
-                            break
-                        else:
-                            messages = None
-                    if not messages:
-                        compress_level = -1
-                        messages = clean_messages(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": instantiate_prompt(original_lean_context, level=compress_level),
-                                }
-                            ]
-                        )
-                        if token_counter(model=model, messages=messages) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
-
-                case PromptContext.ZERO_SHOT_FINETUNED:
-                    compress_level = 0
-                    messages = clean_messages(
-                        [
-                            {
-                                "role": "user",
-                                "content": f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:",
-                            }
-                        ]
-                    )
-
-            # dump the messages to a file
+            # Save messages to file
             with open(
                 os.path.join(output_folder, f"input_messages_compress_{compress_level}.json"), "w"
             ) as inputs_file:
@@ -687,7 +659,7 @@ def _formalize_node(
                     api_key=api_key,
                     api_base=api_base_url,
                     model=model,
-                    messages=messages,
+                    messages=messages["messages"],
                     max_tokens=max_generated_tokens,
                     temperature=temperature,
                     top_p=top_p,
@@ -695,70 +667,41 @@ def _formalize_node(
                     caching=True,
                     stop=stopwords,
                 )
+
+                predictions = [
+                    choice.message.content if choice.message.content and choice.message.content.strip() else None  # type: ignore
+                    for choice in completion_response.choices  # type: ignore
+                ]
+                predictions = [
+                    fix_first_tactic_indentation("\n".join(extract_lean_codes(prediction))) if prediction else None
+                    for prediction in predictions
+                ]
+
             except ContextWindowExceededError:
                 logger.warning(f"Context window exceeded for node {node['label']}")
                 return [None for _ in range(nb_attempts)], 0, 0
-
-            predictions = [
-                choice.message.content if choice.message.content and choice.message.content.strip() else None  # type: ignore
-                for choice in completion_response.choices  # type: ignore
-            ]
-            predictions = [
-                "\n\n".join(extract_lean_codes(prediction)) if prediction else None for prediction in predictions
-            ]
-
         else:
-            match prompt_context:
-                case PromptContext.PROOFNET_FEW_SHOT:
-                    with jsonlines.open(os.path.join(DATA_DIR, "8_shot_proofnet_lean4.jsonl")) as f:
-                        proofnet_few_shot = list(f)
-                    template_few_shot = "Natural language version:\n{nl_statement}\nTranslate the natural language version to a Lean 4 version:"
-                    prompt = "\n\n".join(
-                        [
-                            template_few_shot.format(nl_statement=proofnet["nl_statement"])
-                            + "\n"
-                            + proofnet["formal_statement"]
-                            for proofnet in proofnet_few_shot
-                        ]
-                    )
-                    prompt += "\n\n" + template_few_shot.format(nl_statement=_node_informal_text(node)) + prefix_decl
-                    compress_level = 0
+            # Function to prepare prompt at a specific compression level
+            def prepare_prompt(context: str, level: int) -> dict[str, str]:
+                return {"text": create_prompt_for_context(context, prompt_context, level)}
 
-                case PromptContext.FILE_CONTEXT:
+            if prompt_context == PromptContext.NO_CONTEXT:
+                compress_level = 0
+                prompt_text = prepare_prompt("", compress_level)
+            else:
+                # Find appropriate compression level
+                compress_level, prompt_text = find_appropriate_compression_level(
+                    original_lean_context, prepare_prompt, max_input_tokens
+                )
+            assert isinstance(prompt_text["text"], str)
 
-                    def instantiate_prompt(lean_context: str, level: int = 0) -> str:
-                        lean_context = compress_lean_context(lean_context, level=level)
-                        lean_context += "\n\n" + _node_informal_comment(node, lean_declaration["name"])
-                        return (
-                            "Translate the last problem in comment into Lean4 code (only the core declaration).\n```lean4\n"
-                            + lean_context.strip()
-                            + prefix_decl
-                        ).strip()
+            if not prompt_text or token_counter(model=model, **prompt_text) > max_input_tokens:  # type: ignore
+                logger.warning(f"Natural language context too large for node {node['label']}. Skipping formalization.")
+                return [None for _ in range(nb_attempts)], 0, 0
 
-                    # we assume files are less than 2^16=65536 lines of code, beyond that it is probably useless to try to compress it
-                    prompt = None
-                    compress_level = 0
-                    for compress_level in range(16):
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) <= max_input_tokens:
-                            break
-                        else:
-                            prompt = None
-                    if not prompt:
-                        compress_level = -1
-                        prompt = instantiate_prompt(original_lean_context, level=compress_level)
-                        if token_counter(model=model, text=prompt) > max_input_tokens:
-                            logger.warning(
-                                f"Natural language context too large for node {node['label']}. Skipping formalization."
-                            )
-                            return [None for _ in range(nb_attempts)], 0, 0
+            prompt = prompt_text["text"]
 
-                case PromptContext.ZERO_SHOT_FINETUNED:
-                    compress_level = 0
-                    prompt = f"Natural language version:\n{_node_informal_text(node)}\nTranslate the natural language version to a Lean 4 version:"
-                    prefix_decl = ""
-
-            # dump the context to a file
+            # Save prompt to file
             with open(os.path.join(output_folder, f"input_context_compress_{compress_level}.txt"), "w") as context_file:
                 context_file.write(prompt)
 
@@ -775,26 +718,21 @@ def _formalize_node(
                     stop=stopwords,
                     caching=True,
                 )
+
+                predictions = [
+                    fix_first_tactic_indentation(choice.text)  # type: ignore
+                    if choice.text and choice.text.strip() and choice.finish_reason != "length"  # type: ignore
+                    else None
+                    for choice in completion_response.choices  # type: ignore
+                ]
+
             except ContextWindowExceededError:
                 logger.warning(f"Context window exceeded for node {node['label']}")
                 return [None for _ in range(nb_attempts)], 0, 0
 
-            predictions = [
-                prefix_decl + " " + choice.text if choice.text and choice.text.strip() else None  # type: ignore
-                for choice in completion_response.choices  # type: ignore
-            ]
-
         # dump the completion to a file
         with open(os.path.join(output_folder, "raw_completion.json"), "w") as completion_file:
             completion_file.write(completion_response.model_dump_json(indent=4))  # type: ignore
-
-        if is_theorem(node):
-            predictions = [
-                clean_theorem_string(prediction, new_theorem_name=lean_declaration["name"], add_sorry=True)
-                if prediction
-                else None
-                for prediction in predictions
-            ]
 
     input_tokens = completion_response.usage.prompt_tokens  # type: ignore
     output_tokens = completion_response.usage.completion_tokens  # type: ignore
@@ -804,12 +742,6 @@ def _formalize_node(
         console.print(f"Output tokens: {output_tokens}")
 
     return predictions, input_tokens, output_tokens
-
-
-def is_theorem(node: dict) -> bool:
-    if "lean_declarations" not in node or not node["lean_declarations"]:
-        return False
-    return "theorem_info" in node["lean_declarations"][0]
 
 
 @dataclass
@@ -826,25 +758,14 @@ class ProcessPredictionsInput:
 
 @dataclass
 class PredictionEvaluationResult:
-    lean_code: str | None
+    lean_proof: str | None
     well_typed: bool = False
-    beq_result: BEqCPUResult | None = None
     error: str | None = None
 
 
 def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[PredictionEvaluationResult]]:
-    is_thm = is_theorem(args.node)
-
-    decl_ground_truth = args.lean_declaration["decl_no_comments"]
-    if is_thm:
-        decl_ground_truth = clean_theorem_string(
-            args.lean_declaration["theorem_info"]["declsig_no_comments"],
-            new_theorem_name=args.lean_declaration["name"],
-            add_sorry=True,
-        )
-
-        if decl_ground_truth is None:
-            raise Exception(f"Error while cleaning the ground truth theorem for node {args.node['label']}")
+    decl_proof_gt = args.lean_declaration["decl"]
+    decl = args.lean_declaration["theorem_info"]["declsig"] + " := by"
 
     lean_server = AutoLeanServer(args.repl_config)
 
@@ -889,58 +810,53 @@ def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[
     if not any(args.predictions):
         return (
             args.node["label"],
-            decl_ground_truth,
-            [PredictionEvaluationResult(lean_code=None) for _ in args.predictions],
+            decl,
+            [PredictionEvaluationResult(lean_proof=None) for _ in args.predictions],
         )
 
     # deduplicate the predictions to avoid running the same code multiple times
     dedup_predictions = Counter(args.predictions)
 
+    os.makedirs(args.output_folder, exist_ok=True)
     with jsonlines.open(
         os.path.join(args.output_folder, "postprocessed_dedup_predictions.jsonl"), "w"
     ) as prediction_file:
         prediction_file.write_all({"prediction": prediction} for prediction in dedup_predictions)
 
     # dump the Lean codes with the context to a file
-    for i, lean_code in enumerate(dedup_predictions):
-        if lean_code:
+    for i, lean_proof in enumerate(dedup_predictions):
+        if lean_proof:
             with open(os.path.join(args.output_folder, f"attempt_{i}.lean"), "w") as lean_file:
-                lean_file.write(lean_context + "\n" + lean_code)
+                lean_file.write(lean_context + "\n" + decl + "\n" + lean_proof)
     with open(os.path.join(args.output_folder, "ground_truth.lean"), "w") as lean_file:
-        lean_file.write(lean_context + "\n" + decl_ground_truth)
+        lean_file.write(lean_context + "\n" + decl_proof_gt)
 
     # check that the ground truth is well-typed. It should be, otherwise it means we have a problem with the context
     ground_truth_output = lean_server.run(
-        Command(cmd=decl_ground_truth, env=context_env), timeout=args.timeout_per_prediction
+        Command(cmd=decl_proof_gt, env=context_env), timeout=args.timeout_per_prediction
     )
     if isinstance(ground_truth_output, LeanError) or not ground_truth_output.lean_code_is_valid():
-        raise Exception(f"Invalid ground truth Lean code:\n{str(ground_truth_output)}\n{decl_ground_truth}")
+        raise Exception(f"Invalid ground truth Lean code:\n{str(ground_truth_output)}\n{decl_proof_gt}")
 
     tmp_res: list[PredictionEvaluationResult] = []
-    for i, lean_code in enumerate(dedup_predictions):
-        tmp_res.append(PredictionEvaluationResult(lean_code=lean_code))
+    for i, lean_proof in enumerate(dedup_predictions):
+        tmp_res.append(PredictionEvaluationResult(lean_proof=lean_proof))
 
-        if not lean_code:
+        # fast check for incomplete proofs
+        if not lean_proof or "apply?" in lean_proof or "sorry" in lean_proof or "admit" in lean_proof:
             continue
 
         try:
-            lean_output = lean_server.run(Command(cmd=lean_code, env=context_env), timeout=args.timeout_per_prediction)
+            lean_output = lean_server.run(
+                Command(cmd=decl + "\n" + lean_proof, env=context_env), timeout=args.timeout_per_prediction
+            )
             if isinstance(lean_output, LeanError):
                 continue
-            tmp_res[-1].well_typed = lean_output.lean_code_is_valid(allow_sorry=is_thm)
+            tmp_res[-1].well_typed = lean_output.lean_code_is_valid(allow_sorry=False)
 
             # dump the Lean server output
             with open(os.path.join(args.output_folder, f"type_check_output_{i}.json"), "w") as lean_output_file:
                 lean_output_file.write(json.dumps(lean_output.model_dump(mode="json"), indent=4, ensure_ascii=False))
-
-            if tmp_res[-1].well_typed and is_thm:
-                tmp_res[-1].beq_result = check_theorem_equivalence(
-                    theorem1=lean_code,
-                    theorem2=decl_ground_truth,
-                    lean_server=lean_server,
-                    context_env=context_env,
-                    timeout_per_proof=args.timeout_per_prediction,
-                )
 
         except ValueError as e:
             tmp_res[-1].error = str(e)
@@ -948,10 +864,10 @@ def _process_predictions(args: ProcessPredictionsInput) -> tuple[str, str, list[
             lean_server.restart()
             tmp_res[-1].error = str(e)
 
-    lean_code_to_result = {result.lean_code: result for result in tmp_res}
+    lean_code_to_result = {result.lean_proof: result for result in tmp_res}
     return (
         args.node["label"],
-        decl_ground_truth,
+        decl_proof_gt,
         [lean_code_to_result[prediction] for prediction in args.predictions],
     )
 
@@ -981,8 +897,9 @@ if __name__ == "__main__":
     use_chat_prompt = model_config.get("use_chat_prompt", True)
     stopwords = model_config.get("stopwords", ["```\n", ":= by", "sorry"])
     n_processes = model_config.get("n_processes", 15)
-    gen_processes = model_config.get("gen_processes", 1)
+    gen_processes = model_config.get("gen_processes", None)
     prompt_context = PromptContext[model_config.get("prompt_context", "FILE_CONTEXT")]
+    nl_proof_hint = model_config.get("nl_proof_hint", True)
     api_key = model_config.get("api_key", None)
     api_base_url = model_config.get("api_base_url", None)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -991,8 +908,9 @@ if __name__ == "__main__":
 
     traced_repos_dir = os.path.join(ROOT_DIR, "traced_repos")
 
+    # For storing results across all repos
     all_repos_results = []
-    all_repos_totals = defaultdict(int)
+    all_repos_totals = {}
     total_input_tokens_all = 0
     total_output_tokens_all = 0
 
@@ -1019,8 +937,7 @@ if __name__ == "__main__":
         output_folder = os.path.join(
             ROOT_DIR,
             "results",
-            "formalization",
-            "theorems",
+            "proof",
             project_name_bench,
             model_name.split("/")[-1],
         )
@@ -1030,13 +947,14 @@ if __name__ == "__main__":
         else:
             output_folder = os.path.join(output_folder, timestamp)
 
+        # Copy the benchmark and model config files to the result folder
         os.makedirs(output_folder, exist_ok=True)
         with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
             yaml.safe_dump(benchmark_config, f)
         with open(os.path.join(output_folder, "model_config.yaml"), "w") as f:
             yaml.safe_dump(model_config, f)
 
-        agent = StatementAutoformalizationEvaluation(
+        agent = ProvingEvaluation(
             blueprint_with_lean=blueprint_to_lean,
             lean_files=lean_files,
             lean_declarations=lean_declarations,
@@ -1047,16 +965,11 @@ if __name__ == "__main__":
             source_folder = os.path.join(
                 ROOT_DIR,
                 "results",
-                "formalization",
-                "theorems",
+                "proof",
                 project_name_bench,
                 model_name.split("/")[-1],
                 args.recheck_timestamp,
             )
-
-            if not os.path.exists(source_folder):
-                logger.error(f"Source folder not found: {source_folder}")
-                continue
 
             os.makedirs(output_folder, exist_ok=True)
             with open(os.path.join(output_folder, "benchmark_config.yaml"), "w") as f:
@@ -1129,6 +1042,7 @@ if __name__ == "__main__":
                 n_processes=n_processes,
                 prompt_context=prompt_context,
                 gen_processes=gen_processes,
+                nl_proof_hint=nl_proof_hint,
             )
 
             # Store repo results for summary
@@ -1164,137 +1078,119 @@ if __name__ == "__main__":
     if all_repos_results:
         console.rule(f"Summary of All Repositories - {model_name}")
 
-        # Find all n values and metrics present in any repo's results
+        # Find all n values present in any repo's results
         all_n_values = set()
-        all_metrics = set()
         for repo in all_repos_results:
             agg_results = repo.get("aggregated_results", {})
-            for metric_key in agg_results:
-                all_metrics.add(metric_key)
-                for n_value in agg_results[metric_key].keys():
-                    if n_value != "Total":
-                        all_n_values.add(n_value)
-
-        # Add selection methods to n_values
-        selection_methods = ["Random", "Majority vote", "Self-BLEU"]
-        for method in selection_methods:
-            if any(
-                method in repo.get("aggregated_results", {}).get(list(repo.get("aggregated_results", {}).keys())[0], {})
-                for repo in all_repos_results
-                if repo.get("aggregated_results")
-            ):
-                all_n_values.add(method)
+            if "Well-typed" in agg_results:
+                for key in agg_results["Well-typed"].keys():
+                    all_n_values.add(key)
 
         # Sort n values for consistent display
         all_n_values = sorted(
             all_n_values,
-            key=lambda x: (not isinstance(x, int), x)
-            if isinstance(x, (int, str)) and (isinstance(x, int) or x.isdigit())
-            else float("inf"),
+            key=lambda x: int(x) if isinstance(x, str) and x.isdigit() else (float("inf") if x == "Total" else x),
         )
 
-        # Sort metrics for consistent display
-        metric_order = {"Well-typed": 0, "BEqL": 1, "BEq+": 2}
-        all_metrics = sorted(all_metrics, key=lambda x: metric_order.get(x, float("inf")))
+        # Table for overall metrics
+        summary_table = Table(title="Overall Performance Metrics")
+        summary_table.add_column("Repository", style="cyan")
 
-        # Table for well-typed metrics
-        for metric in all_metrics:
-            metric_table = Table(title=f"{metric} Performance Metrics")
-            metric_table.add_column("Repository", style="cyan")
+        # Add a column for each pass@n value
+        for n in all_n_values:
+            if n != "Total":
+                summary_table.add_column(f"pass@{n}", style="green")
 
-            # Add a column for each pass@n value
+        summary_table.add_column("System Errors", style="red")
+        summary_table.add_column("Empty Predictions", style="yellow")
+        summary_table.add_column("Tokens In/Out", style="blue")
+
+        # Calculate total nodes across all repos
+        total_nodes_all = sum(
+            repo["aggregated_results"].get("Well-typed", {}).get("Total", 0)
+            for repo in all_repos_results
+            if "aggregated_results" in repo
+        )
+
+        # Add rows for each repository
+        for repo in all_repos_results:
+            project_name = repo["project_name"]
+            agg_results = repo["aggregated_results"]
+            stats = repo["total_stats"]
+
+            # Extract metrics
+            total_nodes = agg_results.get("Well-typed", {}).get("Total", 0)
+
+            # Prepare data for the row
+            row_data = [project_name]
+
+            # Add pass@n results
             for n in all_n_values:
-                metric_table.add_column(f"pass@{n}" if isinstance(n, int) else n, style="green")
+                if n == "Total":
+                    continue
+                if "Well-typed" in agg_results and n in agg_results["Well-typed"]:
+                    pass_count = agg_results["Well-typed"][n]
+                    pass_at_n = f"{(pass_count / total_nodes) * 100:.2f}%" if total_nodes > 0 else "N/A"
+                    row_data.append(f"{pass_count}/{total_nodes} ({pass_at_n})")
+                else:
+                    row_data.append("N/A")
 
-            metric_table.add_column("System Errors", style="red")
-            metric_table.add_column("Empty Predictions", style="yellow")
-            metric_table.add_column("Tokens In/Out", style="blue")
-
-            # Calculate total nodes across all repos for this metric
-            metric_total_nodes = sum(
-                repo["aggregated_results"].get(metric, {}).get("Total", 0)
-                for repo in all_repos_results
-                if "aggregated_results" in repo
+            # Add other metrics
+            system_errors = stats.get("System errors", 0)
+            system_errors_percent = (
+                f"{(system_errors / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
             )
+            row_data.append(f"{system_errors}/{total_nodes * nb_samples} ({system_errors_percent})")
 
-            # Add rows for each repository
-            for repo in all_repos_results:
-                project_name = repo["project_name"]
-                agg_results = repo["aggregated_results"]
-                stats = repo["total_stats"]
+            empty_preds = stats.get("Empty predictions", 0)
+            empty_preds_percent = (
+                f"{(empty_preds / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+            )
+            row_data.append(f"{empty_preds}/{total_nodes * nb_samples} ({empty_preds_percent})")
 
-                # Extract metrics
-                total_nodes = agg_results.get(metric, {}).get("Total", 0)
+            tokens = f"{repo['input_tokens']}/{repo['output_tokens']}"
+            row_data.append(tokens)
 
-                # Prepare data for the row
-                row_data = [project_name]
+            summary_table.add_row(*row_data)
 
-                # Add pass@n results
-                for n in all_n_values:
-                    if metric in agg_results and n in agg_results[metric]:
-                        pass_count = agg_results[metric][n]
-                        pass_at_n = f"{(pass_count / total_nodes) * 100:.2f}%" if total_nodes > 0 else "N/A"
-                        row_data.append(f"{int(pass_count)}/{total_nodes} ({pass_at_n})")
-                    else:
-                        row_data.append("N/A")
+        # Add total row
+        if total_nodes_all > 0:
+            # Initialize totals row
+            total_row = ["TOTAL"]
 
-                # Add other metrics
-                system_errors = stats.get("System errors", 0)
-                system_errors_percent = (
-                    f"{(system_errors / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
+            # Calculate aggregate pass@n metrics across all repos
+            for n in all_n_values:
+                if n == "Total":
+                    continue
+                pass_count_total = sum(
+                    repo["aggregated_results"].get("Well-typed", {}).get(n, 0)
+                    for repo in all_repos_results
+                    if "aggregated_results" in repo
                 )
-                row_data.append(f"{system_errors}/{total_nodes * nb_samples} ({system_errors_percent})")
+                pass_at_n_total_percent = f"{(pass_count_total / total_nodes_all) * 100:.2f}%"
+                total_row.append(f"{pass_count_total}/{total_nodes_all} ({pass_at_n_total_percent})")
 
-                empty_preds = stats.get("Empty predictions", 0)
-                empty_preds_percent = (
-                    f"{(empty_preds / (total_nodes * nb_samples)) * 100:.2f}%" if total_nodes > 0 else "N/A"
-                )
-                row_data.append(f"{empty_preds}/{total_nodes * nb_samples} ({empty_preds_percent})")
+            # Add other total metrics
+            system_errors_total = all_repos_totals.get("System errors", 0)
+            system_errors_total_percent = f"{(system_errors_total / (total_nodes_all * nb_samples)) * 100:.2f}%"
+            total_row.append(f"{system_errors_total}/{total_nodes_all * nb_samples} ({system_errors_total_percent})")
 
-                tokens = f"{repo['input_tokens']}/{repo['output_tokens']}"
-                row_data.append(tokens)
+            empty_preds_total = all_repos_totals.get("Empty predictions", 0)
+            empty_preds_total_percent = f"{(empty_preds_total / (total_nodes_all * nb_samples)) * 100:.2f}%"
+            total_row.append(f"{empty_preds_total}/{total_nodes_all * nb_samples} ({empty_preds_total_percent})")
 
-                metric_table.add_row(*row_data)
+            total_row.append(f"{total_input_tokens_all}/{total_output_tokens_all}")
 
-            # Add total row
-            if metric_total_nodes > 0:
-                # Initialize totals row
-                total_row = ["TOTAL"]
+            summary_table.add_section()
+            summary_table.add_row(*total_row)
 
-                # Calculate aggregate pass@n metrics across all repos
-                for n in all_n_values:
-                    pass_count_total = sum(
-                        repo["aggregated_results"].get(metric, {}).get(n, 0)
-                        for repo in all_repos_results
-                        if "aggregated_results" in repo
-                    )
-                    pass_at_n_total_percent = f"{(pass_count_total / metric_total_nodes) * 100:.2f}%"
-                    total_row.append(f"{int(pass_count_total)}/{metric_total_nodes} ({pass_at_n_total_percent})")
-
-                # Add other total metrics
-                system_errors_total = all_repos_totals.get("System errors", 0)
-                system_errors_total_percent = f"{(system_errors_total / (metric_total_nodes * nb_samples)) * 100:.2f}%"
-                total_row.append(
-                    f"{system_errors_total}/{metric_total_nodes * nb_samples} ({system_errors_total_percent})"
-                )
-
-                empty_preds_total = all_repos_totals.get("Empty predictions", 0)
-                empty_preds_total_percent = f"{(empty_preds_total / (metric_total_nodes * nb_samples)) * 100:.2f}%"
-                total_row.append(f"{empty_preds_total}/{metric_total_nodes * nb_samples} ({empty_preds_total_percent})")
-
-                total_row.append(f"{total_input_tokens_all}/{total_output_tokens_all}")
-
-                metric_table.add_section()
-                metric_table.add_row(*total_row)
-
-            console.print(metric_table)
+        console.print(summary_table)
 
         # Save summary to file
         summary_output_dir = os.path.join(
             ROOT_DIR,
             "results",
-            "formalization",
-            "theorems",
+            "proof",
             "summary",
             model_name.split("/")[-1],
         )
@@ -1309,21 +1205,15 @@ if __name__ == "__main__":
             json.dump(
                 {
                     "model": model_name,
-                    "total_metrics": {
-                        metric: sum(
-                            repo["aggregated_results"].get(metric, {}).get("Total", 0)
-                            for repo in all_repos_results
-                            if "aggregated_results" in repo
-                        )
-                        for metric in all_metrics
-                    },
+                    "total_nodes": total_nodes_all,
                     "all_repos_totals": all_repos_totals,
                     "repositories": [
                         {
                             "name": repo["project_name"],
-                            "metrics": {
-                                metric: {n: repo["aggregated_results"].get(metric, {}).get(n, 0) for n in all_n_values}
-                                for metric in all_metrics
+                            "pass_at_n": {
+                                n: repo["aggregated_results"].get("Well-typed", {}).get(n, 0)
+                                for n in all_n_values
+                                if n != "Total"
                             },
                             "total_nodes": repo["aggregated_results"].get("Well-typed", {}).get("Total", 0),
                             "system_errors": repo["total_stats"].get("System errors", 0),

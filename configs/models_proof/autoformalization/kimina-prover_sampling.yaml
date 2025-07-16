@@ -1,0 +1,17 @@
+model: "hosted_vllm/AI-MO/Kimina-Prover-Preview-Distill-7B"
+temperature: 0.6
+top_p: 0.95
+nb_samples: 128
+max_total_tokens: 16384
+max_generated_tokens: 4096
+use_chat_prompt: false
+stopwords:
+  - "```"
+  - "sorry"
+  - "\n\n"
+n_processes: 50
+gen_processes: 20
+prompt_context: "FILE_CONTEXT"
+nl_proof_hint: true
+api_key: "-"
+api_base_url: "http://localhost:8080/v1"

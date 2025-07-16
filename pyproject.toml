@@ -19,9 +19,12 @@ dependencies = [
     "nltk",
     "diskcache",
     "leanblueprint>=0.0.15",
-    "lean-interact==0.5.0",
+    "lean-interact==0.5.3",
     "lean-dojo>=2.1.3",
-    "networkx>=3.4.2"
+    "networkx>=3.4.2",
+    "vllm>=0.8.5.post1",
+    "nvitop>=1.5.0",
+    "setuptools>=80.4.0"
 ]
 
 [build-system]
