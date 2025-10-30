@@ -1,12 +1,11 @@
-# RLM: Evaluation of Autoformalization Methods on Research-Level Mathematics
+# RLMEval: Evaluating Research-Level Neural Theorem Proving & Autoformalization
 
-This repository features the code for the evaluation of autoformalization methods on the RLM25 benchmark.
+This repository features the code for the evaluation of neural theorem proving and autoformalization methods on the RLM25 benchmark.
 
 ## Project setup
 
 > [!IMPORTANT]
 > Set the environment variables `GITHUB_ACCESS_TOKEN` (see [GitHub documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#personal-access-tokens-classic)) and `OPENAI_API_KEY`.
-
 
 ### Development inside Docker (recommended)
 
@@ -40,13 +39,29 @@ Run proof autoformalization evaluation:
 
 ## Citation
 
-[Improving Autoformalization using Type Checking](https://arxiv.org/abs/2406.07222)
+If you use this code or the RLM25 benchmark in your research, please consider citing one of the following papers. If you use the benchmark for evaluating automated theorem proving or proof autoformalization methods, please cite the first paper. If you use it for evaluating statement autoformalization methods, please cite the second paper.
+
+[RLMEval: Evaluating Research-Level Neural Theorem Proving](https://arxiv.org/abs/2510.25427), EMNLP 2025 Findings
 
 ```bibtex
-@misc{poiroux2024improvingautoformalizationusingtype,
-    title={Improving Autoformalization using Type Checking}, 
+@misc{poiroux2025rlmevalevaluatingresearchlevelneural,
+    title={RLMEval: Evaluating Research-Level Neural Theorem Proving}, 
+    author={Auguste Poiroux and Antoine Bosselut and Viktor Kunčak},
+    year={2025},
+    eprint={2510.25427},
+    archivePrefix={arXiv},
+    primaryClass={cs.CL},
+    url={https://arxiv.org/abs/2510.25427}, 
+}
+```
+
+[Reliable Evaluation and Benchmarks for Statement Autoformalization](https://arxiv.org/abs/2406.07222), EMNLP 2025
+
+```bibtex
+@misc{poiroux2025reliableevaluationbenchmarksstatement,
+    title={Reliable Evaluation and Benchmarks for Statement Autoformalization}, 
     author={Auguste Poiroux and Gail Weiss and Viktor Kunčak and Antoine Bosselut},
-    year={2024},
+    year={2025},
     eprint={2406.07222},
     archivePrefix={arXiv},
     primaryClass={cs.CL},
